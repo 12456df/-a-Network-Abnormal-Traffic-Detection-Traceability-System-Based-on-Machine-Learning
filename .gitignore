@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 数据与模型（体积大、不宜入库的可取消注释）
+# *.pcap
+# data/raw/
+# data/processed/
+# *.pkl
+# *.h5
+# *.pt
+# *.pth
+
+# 日志与临时
+*.log
+.env
+~$*
+
+# Jupyter
+.ipynb_checkpoints/
