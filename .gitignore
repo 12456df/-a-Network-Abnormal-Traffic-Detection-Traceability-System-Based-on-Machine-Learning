@@ -22,14 +22,14 @@ build/
 .DS_Store
 Thumbs.db
 
-# 数据与模型（体积大、不宜入库的可取消注释）
-# *.pcap
-# data/raw/
-# data/processed/
-# *.pkl
-# *.h5
-# *.pt
-# *.pth
+# 数据与模型（体积大、不宜入库）
+*.pcap
+rowdata/
+processed/
+*.pkl
+*.h5
+*.pt
+*.pth
 
 # 日志与临时
 *.log
