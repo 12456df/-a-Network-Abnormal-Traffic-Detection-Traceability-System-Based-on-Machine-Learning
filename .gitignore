@@ -26,7 +26,10 @@ Thumbs.db
 *.pcap
 rowdata/
 processed/
+pcap_processed/
+models/
 *.pkl
+*.joblib
 *.h5
 *.pt
 *.pth

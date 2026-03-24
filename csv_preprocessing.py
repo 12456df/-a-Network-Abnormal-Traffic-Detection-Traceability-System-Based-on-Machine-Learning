@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,6 +51,9 @@ class PreprocessConfig:
 
     # 二分类标签列名称
     binary_label_col: str = "binary_label"
+
+    # 样本唯一 ID 列名称，用于训练结果回写和溯源关联
+    sample_id_col: str = "sample_id"
 
     # 训练 / 验证 / 测试集划分比例
     train_ratio: float = 0.7
@@ -124,27 +127,35 @@ def add_binary_label(df: pd.DataFrame, label_col: str, binary_label_col: str) ->
     return df
 
 
-def basic_cleaning(df: pd.DataFrame, label_cols: Iterable[str]) -> Tuple[pd.DataFrame, List[str]]:
+def basic_cleaning(
+    df: pd.DataFrame, protected_cols: Iterable[str]
+) -> Tuple[pd.DataFrame, List[str]]:
     """
     执行基础数据清洗，返回清洗后的 DataFrame 以及数值特征列名列表。
 
     清洗内容包括：
-    - 将特殊值（inf, -inf）替换为 NaN，并删除存在 NaN 的样本（简单策略，后续可改进）。
-    - 删除常数列（所有值相同的列），但保留标签列。
-    - 仅保留数值型特征列作为模型输入（标签列除外）。
+    - 对候选特征列进行 to_numeric(errors='coerce')，统一数值化。
+    - 将特殊值（inf, -inf）替换为 NaN，并删除候选特征存在 NaN 的样本。
+    - 删除常数特征列（所有值相同），但保留受保护列。
+    - 返回数值型特征列作为模型输入。
     """
     df = df.copy()
 
-    # 替换 inf / -inf 为 NaN
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    # 简单策略：丢弃包含 NaN 的行
-    df.dropna(axis=0, how="any", inplace=True)
+    protected_cols_set = set(protected_cols)
+    candidate_feature_cols = [col for col in df.columns if col not in protected_cols_set]
 
-    # 删除常数列（所有值相同），标签列除外
-    label_cols_set = set(label_cols)
+    # 候选特征列统一数值化，无法解析的值会成为 NaN
+    for col in candidate_feature_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 仅针对候选特征处理 inf / NaN，避免因为元数据缺失导致样本被误删
+    df[candidate_feature_cols] = df[candidate_feature_cols].replace([np.inf, -np.inf], np.nan)
+    df.dropna(axis=0, how="any", subset=candidate_feature_cols, inplace=True)
+
+    # 删除常数列（所有值相同），受保护列除外
     constant_cols: List[str] = []
     for col in df.columns:
-        if col in label_cols_set:
+        if col in protected_cols_set:
             continue
         if df[col].nunique(dropna=False) <= 1:
             constant_cols.append(col)
@@ -152,11 +163,11 @@ def basic_cleaning(df: pd.DataFrame, label_cols: Iterable[str]) -> Tuple[pd.Data
     if constant_cols:
         df.drop(columns=constant_cols, inplace=True)
 
-    # 数值特征列 = 所有非标签列中，dtype 为 number 的列
+    # 数值特征列 = 所有非受保护列中，dtype 为 number 的列
     numeric_cols = [
         col
         for col in df.columns
-        if col not in label_cols_set and pd.api.types.is_numeric_dtype(df[col])
+        if col not in protected_cols_set and pd.api.types.is_numeric_dtype(df[col])
     ]
 
     return df, numeric_cols
@@ -167,6 +178,7 @@ def split_train_val_test(
     label_col: str,
     feature_cols: List[str],
     config: PreprocessConfig,
+    passthrough_cols: List[str] | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     按照配置比例，将数据划分为 train / val / test。
@@ -203,7 +215,175 @@ def split_train_val_test(
     test_df = x_test.copy()
     test_df[label_col] = y_test.values
 
+    # 保留样本 ID，便于预测结果回写和攻击溯源关联
+    if config.sample_id_col in df.columns:
+        train_df[config.sample_id_col] = df.loc[x_train.index, config.sample_id_col].values
+        val_df[config.sample_id_col] = df.loc[x_val.index, config.sample_id_col].values
+        test_df[config.sample_id_col] = df.loc[x_test.index, config.sample_id_col].values
+
+    # 可选透传额外列（例如同时保留 binary_label 或 Label）
+    if passthrough_cols:
+        for col in passthrough_cols:
+            if col not in df.columns or col == label_col:
+                continue
+            train_df[col] = df.loc[x_train.index, col].values
+            val_df[col] = df.loc[x_val.index, col].values
+            test_df[col] = df.loc[x_test.index, col].values
+
     return train_df, val_df, test_df
+
+
+def add_sample_id(df: pd.DataFrame, sample_id_col: str) -> pd.DataFrame:
+    """
+    为每条样本分配稳定的整型 ID，便于训练、预测与溯源图之间做主键关联。
+    """
+    df = df.copy()
+    df[sample_id_col] = np.arange(len(df), dtype=np.int64)
+    return df
+
+
+def build_trace_outputs(
+    full_df: pd.DataFrame,
+    binary_train_df: pd.DataFrame,
+    binary_val_df: pd.DataFrame,
+    binary_test_df: pd.DataFrame,
+    multiclass_train_df: pd.DataFrame,
+    multiclass_val_df: pd.DataFrame,
+    multiclass_test_df: pd.DataFrame,
+    config: PreprocessConfig,
+) -> Tuple[pd.DataFrame, pd.DataFrame | None]:
+    """
+    构建溯源相关输出：
+    1) trace_metadata：样本级元数据（含 split），可用于将预测结果回写到原始流记录。
+    2) trace_graph_edges：图边级聚合结果，可直接用于图论建模/可视化。
+    """
+    binary_split_map: Dict[int, str] = {}
+    if config.sample_id_col in binary_train_df.columns:
+        binary_split_map.update(
+            {int(v): "train" for v in binary_train_df[config.sample_id_col].values}
+        )
+    if config.sample_id_col in binary_val_df.columns:
+        binary_split_map.update(
+            {int(v): "val" for v in binary_val_df[config.sample_id_col].values}
+        )
+    if config.sample_id_col in binary_test_df.columns:
+        binary_split_map.update(
+            {int(v): "test" for v in binary_test_df[config.sample_id_col].values}
+        )
+
+    multiclass_split_map: Dict[int, str] = {}
+    if config.sample_id_col in multiclass_train_df.columns:
+        multiclass_split_map.update(
+            {int(v): "train" for v in multiclass_train_df[config.sample_id_col].values}
+        )
+    if config.sample_id_col in multiclass_val_df.columns:
+        multiclass_split_map.update(
+            {int(v): "val" for v in multiclass_val_df[config.sample_id_col].values}
+        )
+    if config.sample_id_col in multiclass_test_df.columns:
+        multiclass_split_map.update(
+            {int(v): "test" for v in multiclass_test_df[config.sample_id_col].values}
+        )
+
+    trace_candidate_cols = [
+        config.sample_id_col,
+        "source_file",
+        config.label_col,
+        config.binary_label_col,
+        "Flow ID",
+        "Source IP",
+        "Destination IP",
+        "Source Port",
+        "Destination Port",
+        "Protocol",
+        "Timestamp",
+        "Flow Duration",
+    ]
+    trace_cols = [col for col in trace_candidate_cols if col in full_df.columns]
+    trace_metadata = full_df[trace_cols].copy()
+
+    if config.sample_id_col in trace_metadata.columns:
+        if binary_split_map:
+            trace_metadata["split_binary"] = (
+                trace_metadata[config.sample_id_col]
+                .map(binary_split_map)
+                .fillna("unknown")
+            )
+        if multiclass_split_map:
+            trace_metadata["split_multiclass"] = (
+                trace_metadata[config.sample_id_col]
+                .map(multiclass_split_map)
+                .fillna("unknown")
+            )
+
+    # 构建图边数据：
+    # 1) 优先使用 Source IP -> Destination IP（标准网络流图）
+    # 2) 若缺失，回退为 source_file -> Flow ID
+    # 3) 进一步回退为 source_file -> Destination Port
+    edge_df = trace_metadata.copy()
+    if {"Source IP", "Destination IP"}.issubset(set(edge_df.columns)):
+        edge_df["src_node"] = edge_df["Source IP"].astype(str)
+        edge_df["dst_node"] = edge_df["Destination IP"].astype(str)
+        edge_df["src_node_type"] = "ip"
+        edge_df["dst_node_type"] = "ip"
+        extra_group_cols = [
+            col
+            for col in ["Source Port", "Destination Port", "Protocol"]
+            if col in edge_df.columns
+        ]
+    elif {"source_file", "Flow ID"}.issubset(set(edge_df.columns)):
+        edge_df["src_node"] = edge_df["source_file"].astype(str)
+        edge_df["dst_node"] = edge_df["Flow ID"].astype(str)
+        edge_df["src_node_type"] = "file"
+        edge_df["dst_node_type"] = "flow"
+        extra_group_cols = []
+    elif {"source_file", "Destination Port"}.issubset(set(edge_df.columns)):
+        edge_df["src_node"] = edge_df["source_file"].astype(str)
+        edge_df["dst_node"] = edge_df["Destination Port"].astype(str)
+        edge_df["src_node_type"] = "file"
+        edge_df["dst_node_type"] = "port"
+        extra_group_cols = []
+    else:
+        return trace_metadata, None
+
+    edge_group_cols = ["src_node", "dst_node", "src_node_type", "dst_node_type", *extra_group_cols]
+    if "Timestamp" in edge_df.columns:
+        edge_df["Timestamp"] = pd.to_datetime(edge_df["Timestamp"], errors="coerce")
+
+    if config.binary_label_col in edge_df.columns:
+        edge_summary = (
+            edge_df.groupby(edge_group_cols, dropna=False)
+            .agg(
+                flow_count=(config.binary_label_col, "size"),
+                attack_flow_count=(config.binary_label_col, "sum"),
+            )
+            .reset_index()
+        )
+    else:
+        edge_summary = (
+            edge_df.groupby(edge_group_cols, dropna=False)
+            .size()
+            .rename("flow_count")
+            .reset_index()
+        )
+        edge_summary["attack_flow_count"] = np.nan
+
+    if "Timestamp" in edge_df.columns:
+        ts_summary = (
+            edge_df.groupby(edge_group_cols, dropna=False)["Timestamp"]
+            .agg(first_seen="min", last_seen="max")
+            .reset_index()
+        )
+        edge_summary = edge_summary.merge(ts_summary, on=edge_group_cols, how="left")
+
+    if "attack_flow_count" in edge_summary.columns:
+        edge_summary["attack_flow_ratio"] = np.where(
+            edge_summary["flow_count"] > 0,
+            edge_summary["attack_flow_count"] / edge_summary["flow_count"],
+            0.0,
+        )
+
+    return trace_metadata, edge_summary
 
 
 def ensure_processed_dir(path: Path) -> None:
@@ -215,9 +395,12 @@ def ensure_processed_dir(path: Path) -> None:
 
 def save_outputs(
     full_df: pd.DataFrame,
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    test_df: pd.DataFrame,
+    binary_train_df: pd.DataFrame,
+    binary_val_df: pd.DataFrame,
+    binary_test_df: pd.DataFrame,
+    multiclass_train_df: pd.DataFrame,
+    multiclass_val_df: pd.DataFrame,
+    multiclass_test_df: pd.DataFrame,
     feature_cols: List[str],
     config: PreprocessConfig,
 ) -> None:
@@ -230,28 +413,74 @@ def save_outputs(
     full_path = config.processed_dir / "clean_full.csv"
     full_df.to_csv(full_path, index=False)
 
-    # 训练 / 验证 / 测试集
+    # 二分类训练 / 验证 / 测试集（保留兼容文件名 + 显式命名文件）
     train_path = config.processed_dir / "train.csv"
     val_path = config.processed_dir / "val.csv"
     test_path = config.processed_dir / "test.csv"
+    train_binary_path = config.processed_dir / "train_binary.csv"
+    val_binary_path = config.processed_dir / "val_binary.csv"
+    test_binary_path = config.processed_dir / "test_binary.csv"
 
-    train_df.to_csv(train_path, index=False)
-    val_df.to_csv(val_path, index=False)
-    test_df.to_csv(test_path, index=False)
+    binary_train_df.to_csv(train_path, index=False)
+    binary_val_df.to_csv(val_path, index=False)
+    binary_test_df.to_csv(test_path, index=False)
+    binary_train_df.to_csv(train_binary_path, index=False)
+    binary_val_df.to_csv(val_binary_path, index=False)
+    binary_test_df.to_csv(test_binary_path, index=False)
+
+    # 多分类训练 / 验证 / 测试集
+    train_multiclass_path = config.processed_dir / "train_multiclass.csv"
+    val_multiclass_path = config.processed_dir / "val_multiclass.csv"
+    test_multiclass_path = config.processed_dir / "test_multiclass.csv"
+    multiclass_train_df.to_csv(train_multiclass_path, index=False)
+    multiclass_val_df.to_csv(val_multiclass_path, index=False)
+    multiclass_test_df.to_csv(test_multiclass_path, index=False)
+
+    # 无监督学习常用输入：全量特征、仅 BENIGN 训练特征
+    unsup_full_path = config.processed_dir / "unsupervised_features_full.csv"
+    full_df[feature_cols].to_csv(unsup_full_path, index=False)
+
+    unsup_benign_path = config.processed_dir / "unsupervised_benign_train.csv"
+    if config.binary_label_col in binary_train_df.columns:
+        binary_train_df.loc[binary_train_df[config.binary_label_col] == 0, feature_cols].to_csv(
+            unsup_benign_path, index=False
+        )
+    else:
+        binary_train_df[feature_cols].to_csv(unsup_benign_path, index=False)
 
     # 特征列名
     feature_names_path = config.processed_dir / "feature_names.txt"
     feature_names_path.write_text("\n".join(feature_cols), encoding="utf-8")
 
-    # 标签映射信息（当前为二分类）
+    # 标签映射信息（二分类 + 多分类标签空间）
+    multiclass_labels = sorted(full_df[config.label_col].astype(str).unique().tolist())
     label_mapping = {
         config.binary_label_col: {
             "0": "BENIGN",
             "1": "ATTACK (all non-BENIGN labels)",
-        }
+        },
+        config.label_col: {str(i): label for i, label in enumerate(multiclass_labels)},
     }
     label_mapping_path = config.processed_dir / "label_mapping.json"
     label_mapping_path.write_text(json.dumps(label_mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # 溯源输出：样本级元数据 + 图边级聚合
+    trace_metadata, trace_edges = build_trace_outputs(
+        full_df=full_df,
+        binary_train_df=binary_train_df,
+        binary_val_df=binary_val_df,
+        binary_test_df=binary_test_df,
+        multiclass_train_df=multiclass_train_df,
+        multiclass_val_df=multiclass_val_df,
+        multiclass_test_df=multiclass_test_df,
+        config=config,
+    )
+    trace_metadata_path = config.processed_dir / "trace_metadata.csv"
+    trace_metadata.to_csv(trace_metadata_path, index=False)
+
+    if trace_edges is not None:
+        trace_edges_path = config.processed_dir / "trace_graph_edges.csv"
+        trace_edges.to_csv(trace_edges_path, index=False)
 
 
 def run_preprocessing(config: PreprocessConfig | None = None) -> None:
@@ -270,24 +499,52 @@ def run_preprocessing(config: PreprocessConfig | None = None) -> None:
 
     # 新增二分类标签列
     combined = add_binary_label(combined, config.label_col, config.binary_label_col)
+    combined = add_sample_id(combined, config.sample_id_col)
 
-    # 基础清洗，使用二分类标签作为主要训练目标
-    label_cols = [config.label_col, config.binary_label_col]
-    cleaned_df, feature_cols = basic_cleaning(combined, label_cols=label_cols)
+    # 基础清洗，使用二分类标签作为主要训练目标；并保护溯源字段不被作为特征
+    protected_cols = [
+        config.label_col,
+        config.binary_label_col,
+        config.sample_id_col,
+        "source_file",
+        "Flow ID",
+        "Source IP",
+        "Destination IP",
+        "Source Port",
+        "Destination Port",
+        "Protocol",
+        "Timestamp",
+    ]
+    cleaned_df, feature_cols = basic_cleaning(combined, protected_cols=protected_cols)
+    if not feature_cols:
+        raise RuntimeError("清洗后无可用数值特征，请检查输入数据和字段配置。")
 
-    # 为后续训练方便，这里默认使用二分类标签列作为目标
-    train_df, val_df, test_df = split_train_val_test(
+    # 输出二分类切分（是否攻击）
+    binary_train_df, binary_val_df, binary_test_df = split_train_val_test(
         cleaned_df,
         label_col=config.binary_label_col,
         feature_cols=feature_cols,
         config=config,
+        passthrough_cols=[config.label_col],
+    )
+
+    # 输出多分类切分（攻击类别识别）
+    multiclass_train_df, multiclass_val_df, multiclass_test_df = split_train_val_test(
+        cleaned_df,
+        label_col=config.label_col,
+        feature_cols=feature_cols,
+        config=config,
+        passthrough_cols=[config.binary_label_col],
     )
 
     save_outputs(
         full_df=cleaned_df,
-        train_df=train_df,
-        val_df=val_df,
-        test_df=test_df,
+        binary_train_df=binary_train_df,
+        binary_val_df=binary_val_df,
+        binary_test_df=binary_test_df,
+        multiclass_train_df=multiclass_train_df,
+        multiclass_val_df=multiclass_val_df,
+        multiclass_test_df=multiclass_test_df,
         feature_cols=feature_cols,
         config=config,
     )
