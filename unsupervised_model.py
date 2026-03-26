@@ -2,27 +2,19 @@
 unsupervised_model.py
 =====================
 
-Unsupervised anomaly detection: Isolation Forest + Autoencoder.
+Unsupervised anomaly detection — improved version.
 
-Training paradigm: learn "normal" traffic patterns from BENIGN-only samples;
-flag deviations as anomalies.  Outputs anomaly scores and threshold-based
-predictions compatible with the supervised pipeline and traceback module.
+Models:  Isolation Forest  ·  Autoencoder (wider)  ·  VAE
+Feature: MI feature selection  ·  PCA analysis
+Eval:    F1-optimal threshold  ·  per-attack-type recall  ·  ensemble scoring
 
-Inputs  (from csv_preprocessing.py):
-    processed/unsupervised_benign_train.csv   – BENIGN-only features for training
-    processed/val_binary.csv                  – labelled val set for threshold tuning
-    processed/test_binary.csv                 – labelled test set for evaluation
-    processed/feature_names.txt               – ordered feature column names
+Inputs  (from csv_preprocessing.py → processed/):
+    unsupervised_benign_train.csv, train_binary.csv (for MI),
+    val_binary.csv, test_binary.csv, feature_names.txt
 
 Outputs:
-    models/unsupervised_iforest.joblib
-    models/unsupervised_autoencoder.pth
-    models/unsupervised_scaler.joblib
-    models/unsupervised_thresholds.json
-    models/unsupervised_manifest.json
-    processed/test_predictions_unsupervised.csv
-    processed/metrics_unsupervised.json
-    processed/ip_attack_summary_test_unsupervised.csv
+    models/  — iforest, ae, vae, scaler, thresholds, manifest
+    processed/ — predictions, metrics, per-attack analysis, IP summary
 """
 
 from __future__ import annotations
@@ -41,7 +33,9 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
+from sklearn.feature_selection import mutual_info_classif
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -59,388 +53,384 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
-# JSON helpers (shared pattern with supervised_model.py)
+# JSON helpers
 # ---------------------------------------------------------------------------
 
-
-def _sanitize_for_json(obj: Any) -> Any:
+def _sanitize(obj: Any) -> Any:
     if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
         return None
     if isinstance(obj, dict):
-        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+        return {k: _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_json(v) for v in obj]
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
     return obj
 
 
-def safe_json_dumps(obj: Any, **kwargs: Any) -> str:
-    return json.dumps(_sanitize_for_json(obj), **kwargs)
+def _json(obj: Any, **kw: Any) -> str:
+    return json.dumps(_sanitize(obj), **kw)
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-
 @dataclass
-class UnsupervisedConfig:
+class Cfg:
     processed_dir: Path = PROJECT_ROOT / "processed"
     model_dir: Path = PROJECT_ROOT / "models"
     binary_label_col: str = "binary_label"
+    label_col: str = "Label"
     sample_id_col: str = "sample_id"
     random_state: int = 42
+
+    # Feature selection
+    mi_top_k: int = 50
+    mi_subsample: int = 100_000
+    pca_variance_ratio: float = 0.95
 
     # Isolation Forest
     if_n_estimators: int = 300
     if_max_samples: int | str = "auto"
     if_contamination: float | str = "auto"
 
-    # Autoencoder
+    # Autoencoder (wider)
+    ae_bottleneck_dim: int = 20
+    ae_n_layers: int = 3
     ae_epochs: int = 80
     ae_batch_size: int = 2048
     ae_lr: float = 1e-3
     ae_weight_decay: float = 1e-5
     ae_patience: int = 10
-    ae_dropout: float = 0.1
-    ae_bottleneck_dim: int = 12
+    ae_dropout: float = 0.15
 
-    # Threshold targets (mirror supervised_model.py)
+    # VAE
+    vae_bottleneck_dim: int = 20
+    vae_n_layers: int = 3
+    vae_beta: float = 0.5
+    vae_epochs: int = 80
+    vae_lr: float = 1e-3
+    vae_patience: int = 10
+
+    # Thresholds
     precision_target: float = 0.995
     recall_target: float = 0.995
 
     ip_attack_ratio_threshold: float = 0.5
 
-    def __post_init__(self) -> None:
-        for name in ("precision_target", "recall_target", "ip_attack_ratio_threshold"):
-            val = getattr(self, name)
-            if not 0.0 <= val <= 1.0:
-                raise ValueError(f"{name} 必须在 [0, 1] 范围内，当前值: {val}")
-
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Data helpers
 # ---------------------------------------------------------------------------
 
-
-def _must_exist(path: Path) -> None:
+def _must(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(f"缺少文件: {path}")
 
 
 def read_feature_names(path: Path) -> list[str]:
-    _must_exist(path)
-    names = [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    if not names:
-        raise RuntimeError(f"特征列表为空: {path}")
-    return names
+    _must(path)
+    return [l.strip() for l in path.read_text("utf-8").splitlines() if l.strip()]
 
 
-def load_benign_train(processed_dir: Path) -> pd.DataFrame:
-    path = processed_dir / "unsupervised_benign_train.csv"
-    _must_exist(path)
-    return pd.read_csv(path)
+def load_csv(processed_dir: Path, name: str) -> pd.DataFrame:
+    p = processed_dir / name
+    _must(p)
+    return pd.read_csv(p)
 
 
-def load_split(processed_dir: Path, filename: str) -> pd.DataFrame:
-    path = processed_dir / filename
-    _must_exist(path)
-    return pd.read_csv(path)
-
-
-def extract_features(
-    df: pd.DataFrame, feature_cols: list[str]
-) -> np.ndarray:
-    missing = [c for c in feature_cols if c not in df.columns]
+def extract_features(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
+    missing = [c for c in cols if c not in df.columns]
     if missing:
-        raise KeyError(f"数据缺少特征列，示例: {missing[:5]}")
-    return df[feature_cols].to_numpy(dtype=np.float64)
+        raise KeyError(f"缺少特征列: {missing[:5]}")
+    return df[cols].to_numpy(dtype=np.float64)
 
 
 def clean_array(arr: np.ndarray, medians: np.ndarray) -> np.ndarray:
-    """Replace inf / NaN with pre-computed column medians."""
-    result = arr.copy()
-    bad = ~np.isfinite(result)
+    out = arr.copy()
+    bad = ~np.isfinite(out)
     if bad.any():
-        row_idx, col_idx = np.where(bad)
-        result[row_idx, col_idx] = medians[col_idx]
-    return result
+        r, c = np.where(bad)
+        out[r, c] = medians[c]
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Metrics (shared pattern with supervised_model.py)
+# Feature selection: Mutual Information
 # ---------------------------------------------------------------------------
 
+def compute_mi_ranking(
+    X: np.ndarray, y: np.ndarray, feature_names: list[str],
+    subsample: int = 100_000, seed: int = 42,
+) -> List[Tuple[str, float]]:
+    if len(X) > subsample:
+        rng = np.random.RandomState(seed)
+        idx = rng.choice(len(X), subsample, replace=False)
+        X, y = X[idx], y[idx]
+    mi = mutual_info_classif(X, y, random_state=seed)
+    return sorted(zip(feature_names, mi.tolist()), key=lambda t: -t[1])
 
-def metrics_dict(
-    y_true: np.ndarray, y_pred: np.ndarray, y_score: np.ndarray | None
-) -> Dict[str, float]:
+
+def select_top_mi(
+    ranking: List[Tuple[str, float]], all_features: list[str], k: int,
+) -> Tuple[list[str], list[int]]:
+    selected = [f for f, _ in ranking[:k]]
+    indices = [all_features.index(f) for f in selected]
+    return selected, indices
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def _metrics(y_true: np.ndarray, y_pred: np.ndarray, y_score: np.ndarray | None) -> Dict[str, Any]:
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
-    result = {
+    r: Dict[str, Any] = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         "recall": float(recall_score(y_true, y_pred, zero_division=0)),
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
         "fpr": float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0,
-        "tn": float(tn),
-        "fp": float(fp),
-        "fn": float(fn),
-        "tp": float(tp),
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
     }
     if y_score is not None and len(np.unique(y_true)) > 1:
-        result["auc"] = float(roc_auc_score(y_true, y_score))
+        r["auc"] = float(roc_auc_score(y_true, y_score))
     else:
-        result["auc"] = float("nan")
-    return result
+        r["auc"] = float("nan")
+    return r
 
 
-def print_metrics(
-    name: str,
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    y_score: np.ndarray | None,
-) -> Dict[str, float]:
-    result = metrics_dict(y_true, y_pred, y_score)
-    print(f"\n[{name}]")
+def print_metrics(tag: str, y_true: np.ndarray, y_pred: np.ndarray,
+                  y_score: np.ndarray | None) -> Dict[str, Any]:
+    r = _metrics(y_true, y_pred, y_score)
     print(
-        "accuracy={accuracy:.4f} precision={precision:.4f} recall={recall:.4f} "
-        "f1={f1:.4f} auc={auc:.4f} fpr={fpr:.4f}".format(**result)
+        f"  [{tag}] acc={r['accuracy']:.4f} prec={r['precision']:.4f} "
+        f"rec={r['recall']:.4f} f1={r['f1']:.4f} auc={r['auc']:.4f} fpr={r['fpr']:.4f}"
     )
-    print(
-        "confusion_matrix [[tn, fp], [fn, tp]] =",
-        [
-            [int(result["tn"]), int(result["fp"])],
-            [int(result["fn"]), int(result["tp"])],
-        ],
-    )
-    print("classification_report:")
-    print(classification_report(y_true, y_pred, digits=4, zero_division=0))
-    return result
+    return r
 
 
 # ---------------------------------------------------------------------------
-# Threshold helpers (same logic as supervised_model.py)
+# Threshold helpers
 # ---------------------------------------------------------------------------
 
-
-def find_high_precision_threshold(
-    y_true: np.ndarray, y_score: np.ndarray, target: float
-) -> float:
-    precisions, recalls, thresholds = precision_recall_curve(y_true, y_score)
-    valid = np.where(precisions[:-1] >= target)[0]
-    if len(valid) == 0:
-        best = int(np.nanargmax(precisions[:-1]))
-        return float(thresholds[best])
-    best = valid[int(np.nanargmax(recalls[valid]))]
-    return float(thresholds[best])
+def find_hp_threshold(y: np.ndarray, s: np.ndarray, target: float) -> float:
+    pr, rc, th = precision_recall_curve(y, s)
+    v = np.where(pr[:-1] >= target)[0]
+    if len(v) == 0:
+        return float(th[int(np.nanargmax(pr[:-1]))])
+    return float(th[v[int(np.nanargmax(rc[v]))]])
 
 
-def find_high_recall_threshold(
-    y_true: np.ndarray, y_score: np.ndarray, target: float
-) -> float:
-    precisions, recalls, thresholds = precision_recall_curve(y_true, y_score)
-    valid = np.where(recalls[:-1] >= target)[0]
-    if len(valid) == 0:
-        best = int(np.nanargmax(recalls[:-1]))
-        return float(thresholds[best])
-    best = valid[int(np.nanargmax(precisions[valid]))]
-    return float(thresholds[best])
+def find_hr_threshold(y: np.ndarray, s: np.ndarray, target: float) -> float:
+    pr, rc, th = precision_recall_curve(y, s)
+    v = np.where(rc[:-1] >= target)[0]
+    if len(v) == 0:
+        return float(th[int(np.nanargmax(rc[:-1]))])
+    return float(th[v[int(np.nanargmax(pr[v]))]])
 
 
-def find_default_threshold(
-    y_score_benign: np.ndarray, percentile: float = 99.0
-) -> float:
-    """99th-percentile of benign scores → ~1 % FPR on normal traffic."""
-    return float(np.percentile(y_score_benign, percentile))
+def find_best_f1_threshold(y: np.ndarray, s: np.ndarray) -> float:
+    pr, rc, th = precision_recall_curve(y, s)
+    f1_arr = np.where((pr[:-1] + rc[:-1]) > 0,
+                       2 * pr[:-1] * rc[:-1] / (pr[:-1] + rc[:-1]), 0.0)
+    return float(th[int(np.nanargmax(f1_arr))])
 
 
-def evaluate_threshold_bundle(
-    split_name: str,
-    y_true: np.ndarray,
-    y_score: np.ndarray,
-    thresholds: Dict[str, float],
-) -> Dict[str, Dict[str, float]]:
-    all_metrics: Dict[str, Dict[str, float]] = {}
+def find_default_threshold(benign_scores: np.ndarray, pct: float = 99.0) -> float:
+    return float(np.percentile(benign_scores, pct))
+
+
+def build_thresholds(y_val: np.ndarray, val_scores: np.ndarray,
+                     cfg: Cfg) -> Dict[str, float]:
+    benign = val_scores[y_val == 0]
+    return {
+        "default": find_default_threshold(benign),
+        "high_precision": find_hp_threshold(y_val, val_scores, cfg.precision_target),
+        "high_recall": find_hr_threshold(y_val, val_scores, cfg.recall_target),
+        "best_f1": find_best_f1_threshold(y_val, val_scores),
+    }
+
+
+def evaluate_all_thresholds(
+    tag: str, y: np.ndarray, scores: np.ndarray, thresholds: Dict[str, float],
+) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
     for key, th in thresholds.items():
-        y_pred = (y_score >= th).astype(int)
-        m = print_metrics(
-            f"{split_name}-{key}(th={th:.6f})", y_true, y_pred, y_score
-        )
-        all_metrics[key] = m
-    return all_metrics
+        pred = (scores >= th).astype(int)
+        out[key] = print_metrics(f"{tag}/{key}(th={th:.6f})", y, pred, scores)
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Isolation Forest
 # ---------------------------------------------------------------------------
 
-
-def train_isolation_forest(
-    X_train: np.ndarray, cfg: UnsupervisedConfig
-) -> IsolationForest:
-    model = IsolationForest(
+def train_iforest(X: np.ndarray, cfg: Cfg) -> IsolationForest:
+    m = IsolationForest(
         n_estimators=cfg.if_n_estimators,
         max_samples=cfg.if_max_samples,
         contamination=cfg.if_contamination,
-        random_state=cfg.random_state,
-        n_jobs=-1,
+        random_state=cfg.random_state, n_jobs=-1,
     )
-    print(
-        f"  n_estimators={cfg.if_n_estimators}, "
-        f"max_samples={cfg.if_max_samples}, "
-        f"contamination={cfg.if_contamination}"
-    )
-    model.fit(X_train)
-    return model
+    m.fit(X)
+    return m
 
 
-def score_isolation_forest(
-    model: IsolationForest, X: np.ndarray
-) -> np.ndarray:
-    """Higher value → more anomalous (negate sklearn convention)."""
-    return -model.decision_function(X)
+def score_iforest(m: IsolationForest, X: np.ndarray) -> np.ndarray:
+    return -m.decision_function(X)
 
 
 # ---------------------------------------------------------------------------
-# Autoencoder
+# Autoencoder (flexible depth / width)
 # ---------------------------------------------------------------------------
+
+def _make_dims(input_dim: int, bottleneck: int, n_layers: int) -> list[int]:
+    return np.linspace(input_dim, bottleneck, n_layers + 1).astype(int).tolist()
+
+
+def _build_layers(dims: list[int], dropout: float, skip_last_act: bool = True) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    for i in range(len(dims) - 1):
+        layers.append(nn.Linear(dims[i], dims[i + 1]))
+        is_last = i == len(dims) - 2
+        if not (skip_last_act and is_last):
+            layers.append(nn.BatchNorm1d(dims[i + 1]))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+    return nn.Sequential(*layers)
 
 
 class Autoencoder(nn.Module):
-    def __init__(
-        self, input_dim: int, bottleneck_dim: int = 12, dropout: float = 0.1
-    ):
+    def __init__(self, input_dim: int, bottleneck: int, n_layers: int = 3,
+                 dropout: float = 0.15):
         super().__init__()
-        h1 = max(bottleneck_dim * 4, input_dim * 2 // 3)
-        h2 = max(bottleneck_dim * 2, input_dim // 3)
-
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, h1),
-            nn.BatchNorm1d(h1),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(h1, h2),
-            nn.BatchNorm1d(h2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(h2, bottleneck_dim),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(bottleneck_dim, h2),
-            nn.BatchNorm1d(h2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(h2, h1),
-            nn.BatchNorm1d(h1),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(h1, input_dim),
-        )
+        dims = _make_dims(input_dim, bottleneck, n_layers)
+        self.encoder = _build_layers(dims, dropout, skip_last_act=True)
+        self.decoder = _build_layers(list(reversed(dims)), dropout, skip_last_act=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.encoder(x))
 
 
-def _score_ae_batched(
-    model: Autoencoder,
-    X: torch.Tensor,
-    device: torch.device,
-    batch_size: int = 4096,
-) -> np.ndarray:
-    """Per-sample MSE reconstruction error (higher → more anomalous)."""
+# ---------------------------------------------------------------------------
+# VAE
+# ---------------------------------------------------------------------------
+
+class VAE(nn.Module):
+    def __init__(self, input_dim: int, bottleneck: int, n_layers: int = 3,
+                 dropout: float = 0.15):
+        super().__init__()
+        dims = _make_dims(input_dim, bottleneck, n_layers)
+        self.encoder_shared = _build_layers(dims[:-1], dropout, skip_last_act=False)
+        pre = dims[-2]
+        self.fc_mu = nn.Linear(pre, bottleneck)
+        self.fc_logvar = nn.Linear(pre, bottleneck)
+        self.decoder = _build_layers(list(reversed(dims)), dropout, skip_last_act=True)
+
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.encoder_shared(x)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu: torch.Tensor, lv: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            return mu + torch.randn_like(mu) * torch.exp(0.5 * lv)
+        return mu
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, lv = self.encode(x)
+        z = self.reparameterize(mu, lv)
+        return self.decoder(z), mu, lv
+
+
+# ---------------------------------------------------------------------------
+# Unified training & scoring
+# ---------------------------------------------------------------------------
+
+def _score_batched(model: nn.Module, X: torch.Tensor, device: torch.device,
+                   is_vae: bool, bs: int = 4096) -> np.ndarray:
     model.eval()
     parts: list[np.ndarray] = []
     with torch.no_grad():
-        for i in range(0, len(X), batch_size):
-            batch = X[i : i + batch_size].to(device)
-            recon = model(batch)
-            mse = ((recon - batch) ** 2).mean(dim=1)
-            parts.append(mse.cpu().numpy())
+        for i in range(0, len(X), bs):
+            b = X[i:i + bs].to(device)
+            if is_vae:
+                recon, _, _ = model(b)
+            else:
+                recon = model(b)
+            parts.append(((recon - b) ** 2).mean(dim=1).cpu().numpy())
     return np.concatenate(parts)
 
 
-def train_autoencoder(
+def train_reconstruction_model(
+    model: nn.Module,
     X_train: np.ndarray,
     X_val: np.ndarray,
     y_val: np.ndarray,
-    cfg: UnsupervisedConfig,
+    cfg: Cfg,
     device: torch.device,
-) -> Tuple[Autoencoder, List[Dict[str, float]]]:
-    input_dim = X_train.shape[1]
-    model = Autoencoder(input_dim, cfg.ae_bottleneck_dim, cfg.ae_dropout).to(device)
-    print(f"  architecture: {input_dim} → encoder → {cfg.ae_bottleneck_dim} → decoder → {input_dim}")
-    print(f"  parameters: {sum(p.numel() for p in model.parameters()):,}")
+    is_vae: bool = False,
+    label: str = "AE",
+) -> Tuple[nn.Module, List[Dict[str, float]]]:
+    model = model.to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  [{label}] parameters: {n_params:,}")
 
-    train_tensor = torch.tensor(X_train, dtype=torch.float32)
-    val_tensor = torch.tensor(X_val, dtype=torch.float32)
-    train_loader = DataLoader(
-        TensorDataset(train_tensor),
-        batch_size=cfg.ae_batch_size,
-        shuffle=True,
-        drop_last=False,
-    )
+    epochs = cfg.vae_epochs if is_vae else cfg.ae_epochs
+    lr = cfg.vae_lr if is_vae else cfg.ae_lr
+    patience = cfg.vae_patience if is_vae else cfg.ae_patience
 
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=cfg.ae_lr, weight_decay=cfg.ae_weight_decay
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", patience=5, factor=0.5, min_lr=1e-6
-    )
+    train_t = torch.tensor(X_train, dtype=torch.float32)
+    val_t = torch.tensor(X_val, dtype=torch.float32)
+    loader = DataLoader(TensorDataset(train_t), batch_size=cfg.ae_batch_size,
+                        shuffle=True, drop_last=False)
 
-    best_auc = -1.0
-    patience_counter = 0
-    best_state: dict | None = None
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=cfg.ae_weight_decay)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode="max", patience=5, factor=0.5, min_lr=1e-6)
+
+    best_auc, wait, best_state = -1.0, 0, None
     history: List[Dict[str, float]] = []
 
-    for epoch in range(1, cfg.ae_epochs + 1):
-        # ---- train ----
+    for ep in range(1, epochs + 1):
         model.train()
-        epoch_loss = 0.0
-        n_samples = 0
-        for (batch,) in train_loader:
+        total_loss, n = 0.0, 0
+        for (batch,) in loader:
             batch = batch.to(device)
-            recon = model(batch)
-            loss = nn.functional.mse_loss(recon, batch)
-            optimizer.zero_grad()
+            if is_vae:
+                recon, mu, lv = model(batch)
+                recon_loss = nn.functional.mse_loss(recon, batch)
+                kl = -0.5 * torch.mean(1 + lv - mu.pow(2) - lv.exp())
+                loss = recon_loss + cfg.vae_beta * kl
+            else:
+                recon = model(batch)
+                loss = nn.functional.mse_loss(recon, batch)
+            opt.zero_grad()
             loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * len(batch)
-            n_samples += len(batch)
-        epoch_loss /= max(n_samples, 1)
+            opt.step()
+            total_loss += loss.item() * len(batch)
+            n += len(batch)
+        avg_loss = total_loss / max(n, 1)
 
-        # ---- validate (AUC as early-stopping criterion) ----
-        val_scores = _score_ae_batched(model, val_tensor, device)
-        val_auc = (
-            float(roc_auc_score(y_val, val_scores))
-            if len(np.unique(y_val)) > 1
-            else 0.0
-        )
-        scheduler.step(val_auc)
+        val_sc = _score_batched(model, val_t, device, is_vae)
+        vauc = float(roc_auc_score(y_val, val_sc)) if len(np.unique(y_val)) > 1 else 0.0
+        sched.step(vauc)
+        cur_lr = opt.param_groups[0]["lr"]
+        history.append({"epoch": ep, "loss": avg_loss, "val_auc": vauc, "lr": cur_lr})
+        print(f"  [{label}] ep {ep:3d}/{epochs}  loss={avg_loss:.6f}  "
+              f"val_auc={vauc:.4f}  lr={cur_lr:.2e}")
 
-        lr_now = optimizer.param_groups[0]["lr"]
-        history.append(
-            {"epoch": epoch, "train_loss": epoch_loss, "val_auc": val_auc, "lr": lr_now}
-        )
-        print(
-            f"  [AE] epoch {epoch:3d}/{cfg.ae_epochs}  "
-            f"train_loss={epoch_loss:.6f}  val_auc={val_auc:.4f}  lr={lr_now:.2e}"
-        )
-
-        if val_auc > best_auc:
-            best_auc = val_auc
-            patience_counter = 0
+        if vauc > best_auc:
+            best_auc, wait = vauc, 0
             best_state = copy.deepcopy(model.state_dict())
         else:
-            patience_counter += 1
-
-        if patience_counter >= cfg.ae_patience:
-            print(
-                f"  [AE] Early stopping at epoch {epoch}, best val_auc={best_auc:.4f}"
-            )
+            wait += 1
+        if wait >= patience:
+            print(f"  [{label}] Early stop ep {ep}, best_auc={best_auc:.4f}")
             break
 
     if best_state is not None:
@@ -449,345 +439,500 @@ def train_autoencoder(
 
 
 # ---------------------------------------------------------------------------
-# IP-level summary (mirrors supervised_model.save_ip_level_summary)
+# Ensemble scoring
 # ---------------------------------------------------------------------------
 
+def _minmax(scores: np.ndarray, ref: np.ndarray | None = None) -> np.ndarray:
+    ref = ref if ref is not None else scores
+    lo, hi = float(ref.min()), float(ref.max())
+    if hi == lo:
+        return np.zeros_like(scores)
+    return (scores - lo) / (hi - lo)
 
-def save_ip_level_summary(
-    cfg: UnsupervisedConfig, pred_df: pd.DataFrame
-) -> None:
-    trace_path = cfg.processed_dir / "trace_metadata.csv"
-    if not trace_path.exists():
-        print("[IP Summary] 未找到 trace_metadata.csv，跳过 IP 级汇总。")
+
+def search_alpha_2(s1_val: np.ndarray, s2_val: np.ndarray,
+                   y: np.ndarray, steps: int = 21) -> Tuple[float, float]:
+    n1, n2 = _minmax(s1_val), _minmax(s2_val)
+    best_a, best_auc = 0.5, -1.0
+    for a in np.linspace(0, 1, steps):
+        auc = roc_auc_score(y, a * n1 + (1 - a) * n2)
+        if auc > best_auc:
+            best_a, best_auc = float(a), auc
+    return best_a, best_auc
+
+
+def search_weights_3(
+    s1: np.ndarray, s2: np.ndarray, s3: np.ndarray,
+    y: np.ndarray, steps: int = 11,
+) -> Tuple[Tuple[float, float, float], float]:
+    n1, n2, n3 = _minmax(s1), _minmax(s2), _minmax(s3)
+    best_w, best_auc = (1 / 3, 1 / 3, 1 / 3), -1.0
+    grid = np.linspace(0, 1, steps)
+    for w1 in grid:
+        for w2 in grid:
+            w3 = 1.0 - w1 - w2
+            if w3 < -1e-9:
+                continue
+            w3 = max(w3, 0.0)
+            auc = roc_auc_score(y, w1 * n1 + w2 * n2 + w3 * n3)
+            if auc > best_auc:
+                best_w, best_auc = (float(w1), float(w2), float(w3)), auc
+    return best_w, best_auc
+
+
+def apply_ensemble_2(s1: np.ndarray, s2: np.ndarray, alpha: float,
+                     ref1: np.ndarray, ref2: np.ndarray) -> np.ndarray:
+    return alpha * _minmax(s1, ref1) + (1 - alpha) * _minmax(s2, ref2)
+
+
+def apply_ensemble_3(s1: np.ndarray, s2: np.ndarray, s3: np.ndarray,
+                     w: Tuple[float, float, float],
+                     r1: np.ndarray, r2: np.ndarray, r3: np.ndarray) -> np.ndarray:
+    return w[0] * _minmax(s1, r1) + w[1] * _minmax(s2, r2) + w[2] * _minmax(s3, r3)
+
+
+# ---------------------------------------------------------------------------
+# Per-attack-type analysis
+# ---------------------------------------------------------------------------
+
+def per_attack_analysis(
+    scores: np.ndarray, threshold: float, labels: np.ndarray,
+) -> Dict[str, Dict[str, Any]]:
+    preds = (scores >= threshold).astype(int)
+    result: Dict[str, Dict[str, Any]] = {}
+    for lab in sorted(set(labels)):
+        mask = labels == lab
+        total = int(mask.sum())
+        detected = int(preds[mask].sum())
+        result[lab] = {
+            "total": total,
+            "detected": detected,
+            "recall": round(detected / total, 4) if total > 0 else 0.0,
+        }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# IP-level summary
+# ---------------------------------------------------------------------------
+
+def save_ip_summary(cfg: Cfg, pred_df: pd.DataFrame) -> None:
+    tp = cfg.processed_dir / "trace_metadata.csv"
+    if not tp.exists():
+        print("[IP Summary] trace_metadata.csv 不存在，跳过。")
         return
-
-    trace_df = pd.read_csv(trace_path)
-    required = {cfg.sample_id_col, "Source IP"}
-    if not required.issubset(set(trace_df.columns)):
-        print("[IP Summary] trace_metadata 缺少 sample_id / Source IP，跳过。")
+    trace = pd.read_csv(tp)
+    if not {cfg.sample_id_col, "Source IP"}.issubset(trace.columns):
+        print("[IP Summary] 缺少必要列，跳过。")
         return
-
-    test_trace = trace_df.copy()
-    if "split_binary" in test_trace.columns:
-        test_trace = test_trace[test_trace["split_binary"] == "test"]
-
-    merged = test_trace.merge(pred_df, on=cfg.sample_id_col, how="inner")
+    if "split_binary" in trace.columns:
+        trace = trace[trace["split_binary"] == "test"]
+    merged = trace.merge(pred_df, on=cfg.sample_id_col, how="inner")
     if merged.empty:
-        print("[IP Summary] 测试集预测与 trace_metadata 未匹配到记录，跳过。")
+        print("[IP Summary] 无匹配记录，跳过。")
         return
 
-    ip_summary = (
-        merged.groupby("Source IP", dropna=False)
-        .agg(
-            total_flows=("iforest_pred_default", "size"),
-            iforest_attack_flows=("iforest_pred_default", "sum"),
-            iforest_attack_ratio=("iforest_pred_default", "mean"),
-            ae_attack_flows=("ae_pred_default", "sum"),
-            ae_attack_ratio=("ae_pred_default", "mean"),
-            avg_iforest_score=("iforest_score", "mean"),
-            avg_ae_score=("ae_score", "mean"),
-            true_attack_ratio=("y_true", "mean"),
-        )
-        .reset_index()
-        .sort_values("iforest_attack_ratio", ascending=False)
-    )
+    score_col = "best_ensemble_score" if "best_ensemble_score" in merged.columns else "ae_score"
+    pred_col = "best_ensemble_pred_f1" if "best_ensemble_pred_f1" in merged.columns else "ae_pred_f1"
 
-    out_path = cfg.processed_dir / "ip_attack_summary_test_unsupervised.csv"
-    ip_summary.to_csv(out_path, index=False)
-    print(f"\n[IP Summary] 已输出: {out_path}")
-    print("[IP Summary] Top-10 可疑 IP (按 Isolation Forest 攻击流比例):")
-    for _, row in ip_summary.head(10).iterrows():
-        print(
-            f"  - {row['Source IP']}: "
-            f"if_ratio={float(row['iforest_attack_ratio']):.4f}, "
-            f"ae_ratio={float(row['ae_attack_ratio']):.4f}, "
-            f"flows={int(row['total_flows'])}"
-        )
+    agg = (merged.groupby("Source IP", dropna=False)
+           .agg(total_flows=(pred_col, "size"),
+                attack_flows=(pred_col, "sum"),
+                attack_ratio=(pred_col, "mean"),
+                avg_score=(score_col, "mean"),
+                true_attack_ratio=("y_true", "mean"))
+           .reset_index()
+           .sort_values("attack_ratio", ascending=False))
+    out = cfg.processed_dir / "ip_attack_summary_test_unsupervised.csv"
+    agg.to_csv(out, index=False)
+    print(f"[IP Summary] 已保存: {out}")
+    for _, row in agg.head(10).iterrows():
+        print(f"  {row['Source IP']}: ratio={row['attack_ratio']:.4f}, flows={int(row['total_flows'])}")
 
 
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
-
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Unsupervised anomaly detection: Isolation Forest + Autoencoder."
-    )
-    parser.add_argument("--processed-dir", type=Path, default=PROJECT_ROOT / "processed")
-    parser.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "models")
-    parser.add_argument("--if-n-estimators", type=int, default=300)
-    parser.add_argument("--ae-epochs", type=int, default=80)
-    parser.add_argument("--ae-batch-size", type=int, default=2048)
-    parser.add_argument("--ae-lr", type=float, default=1e-3)
-    parser.add_argument("--ae-patience", type=int, default=10)
-    parser.add_argument("--precision-target", type=float, default=0.995)
-    parser.add_argument("--recall-target", type=float, default=0.995)
-    parser.add_argument(
-        "--device", type=str, default=None, help="cpu / cuda / cuda:0 …"
-    )
-    args = parser.parse_args()
+    pa = argparse.ArgumentParser(description="Unsupervised anomaly detection (improved)")
+    pa.add_argument("--processed-dir", type=Path, default=PROJECT_ROOT / "processed")
+    pa.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "models")
+    pa.add_argument("--mi-top-k", type=int, default=50)
+    pa.add_argument("--ae-bottleneck", type=int, default=20)
+    pa.add_argument("--vae-bottleneck", type=int, default=20)
+    pa.add_argument("--vae-beta", type=float, default=0.5)
+    pa.add_argument("--ae-epochs", type=int, default=80)
+    pa.add_argument("--vae-epochs", type=int, default=80)
+    pa.add_argument("--if-n-estimators", type=int, default=300)
+    pa.add_argument("--device", type=str, default=None)
+    args = pa.parse_args()
 
-    cfg = UnsupervisedConfig(
-        processed_dir=args.processed_dir,
-        model_dir=args.model_dir,
+    cfg = Cfg(
+        processed_dir=args.processed_dir, model_dir=args.model_dir,
+        mi_top_k=args.mi_top_k,
+        ae_bottleneck_dim=args.ae_bottleneck, vae_bottleneck_dim=args.vae_bottleneck,
+        vae_beta=args.vae_beta, ae_epochs=args.ae_epochs, vae_epochs=args.vae_epochs,
         if_n_estimators=args.if_n_estimators,
-        ae_epochs=args.ae_epochs,
-        ae_batch_size=args.ae_batch_size,
-        ae_lr=args.ae_lr,
-        ae_patience=args.ae_patience,
-        precision_target=args.precision_target,
-        recall_target=args.recall_target,
     )
+    device = torch.device(args.device) if args.device else torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[config] device={device}, mi_top_k={cfg.mi_top_k}, "
+          f"ae_bottleneck={cfg.ae_bottleneck_dim}, vae_bottleneck={cfg.vae_bottleneck_dim}")
 
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[unsupervised_model] PyTorch device: {device}")
-
-    # ================================================================
-    # 1. Load data
-    # ================================================================
+    # ==================================================================
+    # 1  LOAD DATA
+    # ==================================================================
     feature_cols = read_feature_names(cfg.processed_dir / "feature_names.txt")
 
-    print("[unsupervised_model] 加载 BENIGN 训练集 …")
-    benign_df = load_benign_train(cfg.processed_dir)
+    print("\n[data] 加载 benign 训练集 …")
+    benign_df = load_csv(cfg.processed_dir, "unsupervised_benign_train.csv")
+
+    print("[data] 加载验证集 …")
+    val_df = load_csv(cfg.processed_dir, "val_binary.csv")
+
+    print("[data] 加载测试集 …")
+    test_df = load_csv(cfg.processed_dir, "test_binary.csv")
+
     X_benign_raw = extract_features(benign_df, feature_cols)
-    del benign_df
-
-    print("[unsupervised_model] 加载验证集 …")
-    val_df = load_split(cfg.processed_dir, "val_binary.csv")
     X_val_raw = extract_features(val_df, feature_cols)
-    y_val = val_df[cfg.binary_label_col].to_numpy(dtype=int)
-
-    print("[unsupervised_model] 加载测试集 …")
-    test_df = load_split(cfg.processed_dir, "test_binary.csv")
     X_test_raw = extract_features(test_df, feature_cols)
+    y_val = val_df[cfg.binary_label_col].to_numpy(dtype=int)
     y_test = test_df[cfg.binary_label_col].to_numpy(dtype=int)
-    sample_ids_test = (
-        test_df[cfg.sample_id_col].to_numpy()
-        if cfg.sample_id_col in test_df.columns
-        else np.arange(len(test_df))
-    )
-    del val_df, test_df
+    sample_ids = (test_df[cfg.sample_id_col].to_numpy()
+                  if cfg.sample_id_col in test_df.columns
+                  else np.arange(len(test_df)))
+    attack_labels = (test_df[cfg.label_col].astype(str).str.strip().to_numpy()
+                     if cfg.label_col in test_df.columns else None)
+    del benign_df, val_df, test_df
 
-    print(
-        f"[unsupervised_model] 数据规模: benign_train={len(X_benign_raw)}, "
-        f"val={len(X_val_raw)}, test={len(X_test_raw)}, features={len(feature_cols)}"
-    )
+    print(f"[data] benign={len(X_benign_raw)}, val={len(X_val_raw)}, "
+          f"test={len(X_test_raw)}, features={len(feature_cols)}")
 
-    # ================================================================
-    # 2. Clean inf / NaN → column medians from benign training set
-    # ================================================================
-    benign_medians = np.nanmedian(
-        np.where(np.isfinite(X_benign_raw), X_benign_raw, np.nan), axis=0
-    )
-    X_benign = clean_array(X_benign_raw, benign_medians)
-    X_val = clean_array(X_val_raw, benign_medians)
-    X_test = clean_array(X_test_raw, benign_medians)
+    # ==================================================================
+    # 2  MI FEATURE SELECTION  (Step 3)
+    # ==================================================================
+    active_features = feature_cols
+    mi_ranking: list | None = None
+
+    if 0 < cfg.mi_top_k < len(feature_cols):
+        print(f"\n[MI] 加载训练集计算互信息 (subsample={cfg.mi_subsample}) …")
+        train_df = load_csv(cfg.processed_dir, "train_binary.csv")
+        X_train_mi = extract_features(train_df, feature_cols)
+        y_train_mi = train_df[cfg.binary_label_col].to_numpy(dtype=int)
+        del train_df
+
+        mi_ranking = compute_mi_ranking(
+            X_train_mi, y_train_mi, feature_cols,
+            subsample=cfg.mi_subsample, seed=cfg.random_state)
+        del X_train_mi, y_train_mi
+
+        selected, sel_idx = select_top_mi(mi_ranking, feature_cols, cfg.mi_top_k)
+        print(f"[MI] 已选择 top-{cfg.mi_top_k} 特征。前 10:")
+        for f, s in mi_ranking[:10]:
+            print(f"    {f}: {s:.4f}")
+        print(f"  被排除的特征 ({len(feature_cols) - cfg.mi_top_k}):")
+        for f, s in mi_ranking[cfg.mi_top_k:]:
+            print(f"    {f}: {s:.4f}")
+
+        X_benign_raw = X_benign_raw[:, sel_idx]
+        X_val_raw = X_val_raw[:, sel_idx]
+        X_test_raw = X_test_raw[:, sel_idx]
+        active_features = selected
+
+    # ==================================================================
+    # 3  CLEAN → SCALE → PCA ANALYSIS  (Step 3)
+    # ==================================================================
+    medians = np.nanmedian(np.where(np.isfinite(X_benign_raw), X_benign_raw, np.nan), axis=0)
+    X_benign = clean_array(X_benign_raw, medians)
+    X_val = clean_array(X_val_raw, medians)
+    X_test = clean_array(X_test_raw, medians)
     del X_benign_raw, X_val_raw, X_test_raw
 
-    # ================================================================
-    # 3. StandardScaler (fit on benign train only)
-    # ================================================================
     scaler = StandardScaler()
     X_benign = scaler.fit_transform(X_benign)
     X_val = scaler.transform(X_val)
     X_test = scaler.transform(X_test)
 
     cfg.model_dir.mkdir(parents=True, exist_ok=True)
-    scaler_path = cfg.model_dir / "unsupervised_scaler.joblib"
-    joblib.dump(scaler, scaler_path)
-    print(f"[unsupervised_model] 已保存 scaler: {scaler_path}")
+    joblib.dump(scaler, cfg.model_dir / "unsupervised_scaler.joblib")
 
-    # ================================================================
-    # 4. Isolation Forest
-    # ================================================================
-    print("\n" + "=" * 60)
-    print("[Isolation Forest] 开始训练 …")
-    iforest = train_isolation_forest(X_benign, cfg)
-
-    if_val_scores = score_isolation_forest(iforest, X_val)
-    if_test_scores = score_isolation_forest(iforest, X_test)
-
-    if_benign_val_scores = if_val_scores[y_val == 0]
-    if_thresholds: Dict[str, float] = {
-        "default": find_default_threshold(if_benign_val_scores),
-        "high_precision": find_high_precision_threshold(
-            y_val, if_val_scores, cfg.precision_target
-        ),
-        "high_recall": find_high_recall_threshold(
-            y_val, if_val_scores, cfg.recall_target
-        ),
+    print(f"\n[PCA] 分析 (variance={cfg.pca_variance_ratio}) …")
+    pca = PCA(n_components=cfg.pca_variance_ratio, svd_solver="full")
+    pca.fit(X_benign)
+    cum_var = np.cumsum(pca.explained_variance_ratio_)
+    pca_info = {
+        "n_components_95": int(pca.n_components_),
+        "input_features": len(active_features),
+        "top_10_explained_variance": pca.explained_variance_ratio_[:10].tolist(),
+        "cumulative_variance": cum_var.tolist(),
     }
-    print(
-        f"\n[IF Thresholds] default={if_thresholds['default']:.6f}, "
-        f"high_precision={if_thresholds['high_precision']:.6f}, "
-        f"high_recall={if_thresholds['high_recall']:.6f}"
-    )
+    print(f"[PCA] {pca.n_components_} 个主成分解释 {cum_var[-1]*100:.1f}% 方差 "
+          f"(输入 {len(active_features)} 特征)")
 
-    print("\n[IF Validation Metrics]")
-    if_val_metrics = evaluate_threshold_bundle(
-        "IF-Val", y_val, if_val_scores, if_thresholds
-    )
-    print("\n[IF Test Metrics]")
-    if_test_metrics = evaluate_threshold_bundle(
-        "IF-Test", y_test, if_test_scores, if_thresholds
-    )
+    input_dim = X_benign.shape[1]
 
-    iforest_path = cfg.model_dir / "unsupervised_iforest.joblib"
-    joblib.dump(iforest, iforest_path)
-    print(f"\n[Isolation Forest] 已保存模型: {iforest_path}")
-
-    # ================================================================
-    # 5. Autoencoder
-    # ================================================================
+    # ==================================================================
+    # 4  ISOLATION FOREST
+    # ==================================================================
     print("\n" + "=" * 60)
-    print("[Autoencoder] 开始训练 …")
-    ae_model, ae_history = train_autoencoder(X_benign, X_val, y_val, cfg, device)
+    print("[IF] 训练 Isolation Forest …")
+    iforest = train_iforest(X_benign, cfg)
+    if_val = score_iforest(iforest, X_val)
+    if_test = score_iforest(iforest, X_test)
+    joblib.dump(iforest, cfg.model_dir / "unsupervised_iforest.joblib")
 
-    ae_val_scores = _score_ae_batched(
-        ae_model, torch.tensor(X_val, dtype=torch.float32), device
-    )
-    ae_test_scores = _score_ae_batched(
-        ae_model, torch.tensor(X_test, dtype=torch.float32), device
-    )
+    if_th = build_thresholds(y_val, if_val, cfg)
+    print("[IF] 阈值:", {k: f"{v:.6f}" for k, v in if_th.items()})
+    print("[IF Val]")
+    if_val_m = evaluate_all_thresholds("IF-Val", y_val, if_val, if_th)
+    print("[IF Test]")
+    if_test_m = evaluate_all_thresholds("IF-Test", y_test, if_test, if_th)
 
-    ae_benign_val_scores = ae_val_scores[y_val == 0]
-    ae_thresholds: Dict[str, float] = {
-        "default": find_default_threshold(ae_benign_val_scores),
-        "high_precision": find_high_precision_threshold(
-            y_val, ae_val_scores, cfg.precision_target
-        ),
-        "high_recall": find_high_recall_threshold(
-            y_val, ae_val_scores, cfg.recall_target
-        ),
+    # ==================================================================
+    # 5  AUTOENCODER (wider)   (Step 4)
+    # ==================================================================
+    print("\n" + "=" * 60)
+    print(f"[AE] 训练 Autoencoder (bottleneck={cfg.ae_bottleneck_dim}) …")
+    ae = Autoencoder(input_dim, cfg.ae_bottleneck_dim, cfg.ae_n_layers, cfg.ae_dropout)
+    ae, ae_hist = train_reconstruction_model(
+        ae, X_benign, X_val, y_val, cfg, device, is_vae=False, label="AE")
+    ae_val = _score_batched(ae, torch.tensor(X_val, dtype=torch.float32), device, False)
+    ae_test = _score_batched(ae, torch.tensor(X_test, dtype=torch.float32), device, False)
+    torch.save({"state": ae.state_dict(), "input_dim": input_dim,
+                "bottleneck": cfg.ae_bottleneck_dim, "n_layers": cfg.ae_n_layers,
+                "dropout": cfg.ae_dropout}, cfg.model_dir / "unsupervised_autoencoder.pth")
+
+    ae_th = build_thresholds(y_val, ae_val, cfg)
+    print("[AE] 阈值:", {k: f"{v:.6f}" for k, v in ae_th.items()})
+    print("[AE Val]")
+    ae_val_m = evaluate_all_thresholds("AE-Val", y_val, ae_val, ae_th)
+    print("[AE Test]")
+    ae_test_m = evaluate_all_thresholds("AE-Test", y_test, ae_test, ae_th)
+
+    # ==================================================================
+    # 6  VAE  (Step 4)
+    # ==================================================================
+    print("\n" + "=" * 60)
+    print(f"[VAE] 训练 VAE (bottleneck={cfg.vae_bottleneck_dim}, β={cfg.vae_beta}) …")
+    vae = VAE(input_dim, cfg.vae_bottleneck_dim, cfg.vae_n_layers, cfg.ae_dropout)
+    vae, vae_hist = train_reconstruction_model(
+        vae, X_benign, X_val, y_val, cfg, device, is_vae=True, label="VAE")
+    vae_val = _score_batched(vae, torch.tensor(X_val, dtype=torch.float32), device, True)
+    vae_test = _score_batched(vae, torch.tensor(X_test, dtype=torch.float32), device, True)
+    torch.save({"state": vae.state_dict(), "input_dim": input_dim,
+                "bottleneck": cfg.vae_bottleneck_dim, "n_layers": cfg.vae_n_layers,
+                "dropout": cfg.ae_dropout, "beta": cfg.vae_beta},
+               cfg.model_dir / "unsupervised_vae.pth")
+
+    vae_th = build_thresholds(y_val, vae_val, cfg)
+    print("[VAE] 阈值:", {k: f"{v:.6f}" for k, v in vae_th.items()})
+    print("[VAE Val]")
+    vae_val_m = evaluate_all_thresholds("VAE-Val", y_val, vae_val, vae_th)
+    print("[VAE Test]")
+    vae_test_m = evaluate_all_thresholds("VAE-Test", y_test, vae_test, vae_th)
+
+    # ==================================================================
+    # 7  ENSEMBLE  (Step 2)
+    # ==================================================================
+    print("\n" + "=" * 60)
+    print("[Ensemble] 搜索最优融合权重 …")
+
+    alpha_if_ae, auc_if_ae = search_alpha_2(if_val, ae_val, y_val)
+    print(f"  IF+AE:  α={alpha_if_ae:.2f}, val_auc={auc_if_ae:.4f}")
+
+    alpha_if_vae, auc_if_vae = search_alpha_2(if_val, vae_val, y_val)
+    print(f"  IF+VAE: α={alpha_if_vae:.2f}, val_auc={auc_if_vae:.4f}")
+
+    alpha_ae_vae, auc_ae_vae = search_alpha_2(ae_val, vae_val, y_val)
+    print(f"  AE+VAE: α={alpha_ae_vae:.2f}, val_auc={auc_ae_vae:.4f}")
+
+    w3, auc_3 = search_weights_3(if_val, ae_val, vae_val, y_val)
+    print(f"  IF+AE+VAE: w=({w3[0]:.2f},{w3[1]:.2f},{w3[2]:.2f}), val_auc={auc_3:.4f}")
+
+    ensemble_configs = [
+        ("IF+AE", auc_if_ae, lambda v, t: (
+            apply_ensemble_2(v[0], v[1], alpha_if_ae, if_val, ae_val),
+            apply_ensemble_2(t[0], t[1], alpha_if_ae, if_val, ae_val))),
+        ("IF+VAE", auc_if_vae, lambda v, t: (
+            apply_ensemble_2(v[0], v[2], alpha_if_vae, if_val, vae_val),
+            apply_ensemble_2(t[0], t[2], alpha_if_vae, if_val, vae_val))),
+        ("AE+VAE", auc_ae_vae, lambda v, t: (
+            apply_ensemble_2(v[1], v[2], alpha_ae_vae, ae_val, vae_val),
+            apply_ensemble_2(t[1], t[2], alpha_ae_vae, ae_val, vae_val))),
+        ("IF+AE+VAE", auc_3, lambda v, t: (
+            apply_ensemble_3(v[0], v[1], v[2], w3, if_val, ae_val, vae_val),
+            apply_ensemble_3(t[0], t[1], t[2], w3, if_val, ae_val, vae_val))),
+    ]
+
+    val_tuple = (if_val, ae_val, vae_val)
+    test_tuple = (if_test, ae_test, vae_test)
+
+    ens_results: Dict[str, Any] = {}
+    best_ens_name, best_ens_auc = "", -1.0
+    best_ens_test_scores: np.ndarray | None = None
+    best_ens_th: Dict[str, float] = {}
+    best_ens_test_m: Dict[str, Any] = {}
+
+    for ens_name, val_auc, fn in ensemble_configs:
+        ens_v, ens_t = fn(val_tuple, test_tuple)
+        eth = build_thresholds(y_val, ens_v, cfg)
+        print(f"\n[{ens_name}] val_auc={val_auc:.4f}, 阈值: "
+              + ", ".join(f"{k}={v:.4f}" for k, v in eth.items()))
+        print(f"[{ens_name} Val]")
+        evm = evaluate_all_thresholds(f"{ens_name}-Val", y_val, ens_v, eth)
+        print(f"[{ens_name} Test]")
+        etm = evaluate_all_thresholds(f"{ens_name}-Test", y_test, ens_t, eth)
+        ens_results[ens_name] = {"val_auc": val_auc, "thresholds": eth,
+                                  "val": evm, "test": etm}
+        if val_auc > best_ens_auc:
+            best_ens_name, best_ens_auc = ens_name, val_auc
+            best_ens_test_scores = ens_t
+            best_ens_th = eth
+            best_ens_test_m = etm
+
+    print(f"\n[Ensemble] 最佳融合: {best_ens_name} (val_auc={best_ens_auc:.4f})")
+
+    # ==================================================================
+    # 8  PER-ATTACK-TYPE ANALYSIS  (Step 1)
+    # ==================================================================
+    attack_analysis: Dict[str, Any] = {}
+    if attack_labels is not None:
+        print("\n" + "=" * 60)
+        print("[Per-Attack] 按攻击类型检出率 (使用 best_f1 阈值)")
+
+        models_for_analysis = [
+            ("IF", if_test, if_th),
+            ("AE", ae_test, ae_th),
+            ("VAE", vae_test, vae_th),
+        ]
+        if best_ens_test_scores is not None:
+            models_for_analysis.append((f"Ens({best_ens_name})", best_ens_test_scores, best_ens_th))
+
+        for mname, mscores, mth in models_for_analysis:
+            pa_result = per_attack_analysis(mscores, mth["best_f1"], attack_labels)
+            attack_analysis[mname] = pa_result
+            print(f"\n  [{mname}] (th={mth['best_f1']:.6f})")
+            for lab, info in pa_result.items():
+                tag = "[Y]" if info["recall"] >= 0.8 else "[N]"
+                print(f"    {tag} {lab}: {info['detected']}/{info['total']} "
+                      f"(recall={info['recall']:.4f})")
+
+    # ==================================================================
+    # 9  SAVE ALL OUTPUTS
+    # ==================================================================
+    print("\n" + "=" * 60)
+    print("[Save] 保存结果 …")
+
+    # Predictions
+    pred_data: Dict[str, Any] = {
+        cfg.sample_id_col: sample_ids,
+        "y_true": y_test,
+        "iforest_score": if_test,
+        "ae_score": ae_test,
+        "vae_score": vae_test,
     }
-    print(
-        f"\n[AE Thresholds] default={ae_thresholds['default']:.6f}, "
-        f"high_precision={ae_thresholds['high_precision']:.6f}, "
-        f"high_recall={ae_thresholds['high_recall']:.6f}"
-    )
+    for mname, mscores, mth in [("iforest", if_test, if_th),
+                                  ("ae", ae_test, ae_th),
+                                  ("vae", vae_test, vae_th)]:
+        for tkey in ("default", "high_precision", "high_recall", "best_f1"):
+            pred_data[f"{mname}_pred_{tkey}"] = (mscores >= mth[tkey]).astype(int)
 
-    print("\n[AE Validation Metrics]")
-    ae_val_metrics = evaluate_threshold_bundle(
-        "AE-Val", y_val, ae_val_scores, ae_thresholds
-    )
-    print("\n[AE Test Metrics]")
-    ae_test_metrics = evaluate_threshold_bundle(
-        "AE-Test", y_test, ae_test_scores, ae_thresholds
-    )
+    if best_ens_test_scores is not None:
+        pred_data["best_ensemble_score"] = best_ens_test_scores
+        for tkey in ("default", "high_precision", "high_recall", "best_f1"):
+            pred_data[f"best_ensemble_pred_{tkey}"] = (
+                best_ens_test_scores >= best_ens_th[tkey]).astype(int)
 
-    ae_model_path = cfg.model_dir / "unsupervised_autoencoder.pth"
-    torch.save(
-        {
-            "model_state_dict": ae_model.state_dict(),
-            "input_dim": len(feature_cols),
-            "bottleneck_dim": cfg.ae_bottleneck_dim,
-            "dropout": cfg.ae_dropout,
-        },
-        ae_model_path,
-    )
-    print(f"\n[Autoencoder] 已保存模型: {ae_model_path}")
-
-    # ================================================================
-    # 6. Save predictions & metrics
-    # ================================================================
-    pred_df = pd.DataFrame(
-        {
-            cfg.sample_id_col: sample_ids_test,
-            "y_true": y_test,
-            "iforest_score": if_test_scores,
-            "ae_score": ae_test_scores,
-            "iforest_pred_default": (if_test_scores >= if_thresholds["default"]).astype(int),
-            "iforest_pred_hp": (if_test_scores >= if_thresholds["high_precision"]).astype(int),
-            "iforest_pred_hr": (if_test_scores >= if_thresholds["high_recall"]).astype(int),
-            "ae_pred_default": (ae_test_scores >= ae_thresholds["default"]).astype(int),
-            "ae_pred_hp": (ae_test_scores >= ae_thresholds["high_precision"]).astype(int),
-            "ae_pred_hr": (ae_test_scores >= ae_thresholds["high_recall"]).astype(int),
-        }
-    )
+    pred_df = pd.DataFrame(pred_data)
     pred_path = cfg.processed_dir / "test_predictions_unsupervised.csv"
     pred_df.to_csv(pred_path, index=False)
-    print(f"\n[unsupervised_model] 已保存测试集预测: {pred_path}")
+    print(f"  预测: {pred_path}")
 
-    all_metrics = {
-        "isolation_forest": {
-            "thresholds": if_thresholds,
-            "val": if_val_metrics,
-            "test": if_test_metrics,
+    # Metrics JSON
+    all_metrics: Dict[str, Any] = {
+        "feature_selection": {
+            "method": "mutual_information" if mi_ranking else "all_features",
+            "n_selected": len(active_features),
+            "n_total": len(feature_cols),
+            "mi_ranking": [(f, round(s, 6)) for f, s in mi_ranking] if mi_ranking else None,
         },
-        "autoencoder": {
-            "thresholds": ae_thresholds,
-            "val": ae_val_metrics,
-            "test": ae_test_metrics,
-            "training_history": ae_history,
-        },
+        "pca_analysis": pca_info,
+        "isolation_forest": {"thresholds": if_th, "val": if_val_m, "test": if_test_m},
+        "autoencoder": {"thresholds": ae_th, "val": ae_val_m, "test": ae_test_m,
+                        "history": ae_hist},
+        "vae": {"thresholds": vae_th, "val": vae_val_m, "test": vae_test_m,
+                "history": vae_hist},
+        "ensembles": ens_results,
+        "best_ensemble": best_ens_name,
+        "per_attack_analysis": attack_analysis,
     }
-    metrics_path = cfg.processed_dir / "metrics_unsupervised.json"
-    metrics_path.write_text(
-        safe_json_dumps(all_metrics, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    print(f"[unsupervised_model] 已保存指标报告: {metrics_path}")
+    mp = cfg.processed_dir / "metrics_unsupervised.json"
+    mp.write_text(_json(all_metrics, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  指标: {mp}")
 
-    thresholds_combined = {
-        "isolation_forest": if_thresholds,
-        "autoencoder": ae_thresholds,
-    }
-    thresholds_path = cfg.model_dir / "unsupervised_thresholds.json"
-    thresholds_path.write_text(
-        safe_json_dumps(thresholds_combined, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    print(f"[unsupervised_model] 已保存阈值配置: {thresholds_path}")
+    # Thresholds
+    tp = cfg.model_dir / "unsupervised_thresholds.json"
+    tp.write_text(_json({
+        "isolation_forest": if_th, "autoencoder": ae_th, "vae": vae_th,
+        "best_ensemble": {"name": best_ens_name, **best_ens_th},
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  阈值: {tp}")
 
+    # Selected features
+    sf = cfg.model_dir / "unsupervised_selected_features.txt"
+    sf.write_text("\n".join(active_features), encoding="utf-8")
+    print(f"  特征: {sf}")
+
+    # Manifest
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "device": str(device),
-        "feature_cols": feature_cols,
-        "n_features": len(feature_cols),
+        "active_features": active_features,
+        "n_features": len(active_features),
         "n_benign_train": int(X_benign.shape[0]),
         "n_val": int(X_val.shape[0]),
         "n_test": int(X_test.shape[0]),
-        "isolation_forest": {
-            "n_estimators": cfg.if_n_estimators,
-            "max_samples": str(cfg.if_max_samples),
-            "contamination": str(cfg.if_contamination),
-        },
+        "isolation_forest": {"n_estimators": cfg.if_n_estimators},
         "autoencoder": {
-            "epochs_run": len(ae_history),
-            "bottleneck_dim": cfg.ae_bottleneck_dim,
-            "dropout": cfg.ae_dropout,
-            "lr": cfg.ae_lr,
-            "weight_decay": cfg.ae_weight_decay,
-            "batch_size": cfg.ae_batch_size,
-            "patience": cfg.ae_patience,
-            "best_val_auc": (
-                max(h["val_auc"] for h in ae_history) if ae_history else None
-            ),
+            "bottleneck": cfg.ae_bottleneck_dim, "n_layers": cfg.ae_n_layers,
+            "epochs_run": len(ae_hist), "dropout": cfg.ae_dropout,
+            "best_val_auc": max(h["val_auc"] for h in ae_hist) if ae_hist else None,
         },
+        "vae": {
+            "bottleneck": cfg.vae_bottleneck_dim, "n_layers": cfg.vae_n_layers,
+            "beta": cfg.vae_beta, "epochs_run": len(vae_hist),
+            "best_val_auc": max(h["val_auc"] for h in vae_hist) if vae_hist else None,
+        },
+        "best_ensemble": best_ens_name,
+        "best_ensemble_val_auc": best_ens_auc,
     }
-    manifest_path = cfg.model_dir / "unsupervised_manifest.json"
-    manifest_path.write_text(
-        safe_json_dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    print(f"[unsupervised_model] 已保存模型元信息: {manifest_path}")
+    mnp = cfg.model_dir / "unsupervised_manifest.json"
+    mnp.write_text(_json(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  元信息: {mnp}")
 
-    # ================================================================
-    # 7. IP-level summary for traceback
-    # ================================================================
-    save_ip_level_summary(cfg, pred_df)
+    # IP summary
+    save_ip_summary(cfg, pred_df)
 
-    print("\n[unsupervised_model] 训练与评估完成。")
+    # ==================================================================
+    # 10  SUMMARY
+    # ==================================================================
+    print("\n" + "=" * 60)
+    print("[Summary] 测试集 best_f1 阈值下各模型 F1:")
+    for mname, mm in [("IF", if_test_m), ("AE", ae_test_m),
+                       ("VAE", vae_test_m), (f"Ens({best_ens_name})", best_ens_test_m)]:
+        bf = mm.get("best_f1", {})
+        print(f"  {mname:20s}  F1={bf.get('f1',0):.4f}  "
+              f"Recall={bf.get('recall',0):.4f}  Prec={bf.get('precision',0):.4f}  "
+              f"AUC={bf.get('auc',0):.4f}")
+
+    print("\n[unsupervised_model] 全部完成。")
 
 
 if __name__ == "__main__":
-    print("[unsupervised_model] 开始无监督异常检测训练 …")
+    print("[unsupervised_model] 开始训练（改进版）…")
     try:
         main()
-    except Exception as exc:
-        print(f"[unsupervised_model] 发生错误: {exc}")
+    except Exception as e:
+        print(f"[unsupervised_model] 错误: {e}")
         raise
-    else:
-        print("[unsupervised_model] 全部完成。")
