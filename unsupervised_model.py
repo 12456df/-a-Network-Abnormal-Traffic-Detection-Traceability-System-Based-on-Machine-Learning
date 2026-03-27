@@ -533,7 +533,7 @@ def save_ip_summary(cfg: Cfg, pred_df: pd.DataFrame) -> None:
         return
 
     score_col = "best_ensemble_score" if "best_ensemble_score" in merged.columns else "ae_score"
-    pred_col = "best_ensemble_pred_f1" if "best_ensemble_pred_f1" in merged.columns else "ae_pred_f1"
+    pred_col = "best_ensemble_pred_best_f1" if "best_ensemble_pred_best_f1" in merged.columns else "ae_pred_best_f1"
 
     agg = (merged.groupby("Source IP", dropna=False)
            .agg(total_flows=(pred_col, "size"),

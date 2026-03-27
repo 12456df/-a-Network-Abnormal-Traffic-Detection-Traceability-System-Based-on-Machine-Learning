@@ -41,7 +41,7 @@ class PreprocessConfig:
     """
 
     # 原始 CSV 所在目录（默认使用 CIC-IDS2017 MachineLearningCVE）
-    raw_csv_dir: Path = PROJECT_ROOT / "rowdata" / "CSVs" / "MachineLearningCVE"
+    raw_csv_dir: Path = PROJECT_ROOT / "rowdata" / "CSVs" / "TrafficLabelling"
 
     # 输出目录（已在仓库中创建 processed/）
     processed_dir: Path = PROJECT_ROOT / "processed"
@@ -86,8 +86,11 @@ def load_and_concat(csv_files: Iterable[Path], label_col: str) -> pd.DataFrame:
     """
     dataframes: List[pd.DataFrame] = []
     for path in csv_files:
-        # 读取时不依赖首列前空格，读取后统一去掉列名两端的空白
-        df = pd.read_csv(path)
+        # TrafficLabelling 含 cp1252 编码字符（如 en-dash），需 fallback
+        try:
+            df = pd.read_csv(path, encoding="utf-8")
+        except UnicodeDecodeError:
+            df = pd.read_csv(path, encoding="cp1252")
         df.columns = df.columns.astype(str).str.strip()
         # 标记来源文件
         df["source_file"] = path.name
@@ -496,6 +499,14 @@ def run_preprocessing(config: PreprocessConfig | None = None) -> None:
 
     csv_files = find_raw_csv_files(config)
     combined = load_and_concat(csv_files, config.label_col)
+
+    # TrafficLabelling 版部分文件含无标签行（Label 为 NaN），需先过滤
+    n_before = len(combined)
+    combined = combined.dropna(subset=[config.label_col])
+    combined = combined[combined[config.label_col].astype(str).str.strip() != ""]
+    n_dropped = n_before - len(combined)
+    if n_dropped > 0:
+        print(f"[csv_preprocessing] 已过滤 {n_dropped} 行无标签数据")
 
     # 新增二分类标签列
     combined = add_binary_label(combined, config.label_col, config.binary_label_col)
