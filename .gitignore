@@ -28,6 +28,7 @@ rowdata/
 processed/
 pcap_processed/
 models/
+traceback/
 *.pkl
 *.joblib
 *.h5
