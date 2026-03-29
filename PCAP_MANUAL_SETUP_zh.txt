@@ -1,0 +1,42 @@
+================================================================================
+PCAP / CICFlowMeter 方案 A — 需你本机自行配置（无法用 pip 安装）
+================================================================================
+
+1) Python 3.12.x
+   - 从 https://www.python.org/downloads/ 安装 3.12（推荐 3.12.7 或当前 3.12 最新补丁版）。
+   - cicflowmeter 0.5.0 要求 Python >= 3.12；若主项目仍用 3.10，请为 PCAP 单独建虚拟环境：
+       py -3.12 -m venv .venv-pcap
+       .venv-pcap\Scripts\activate
+       pip install -r requirements-pcap.txt
+
+2) Npcap（Windows 抓包驱动）
+   - 从 https://npcap.com/ 下载并安装（例如 1.87 或官网当前稳定版）。
+   - 安装时按需勾选 “Install Npcap in WinPcap API-compatible Mode”。
+
+3) tcpdump（供 Scapy / cicflowmeter 子进程使用）
+   - 将 tcpdump.exe 所在目录加入系统 PATH；或安装 Wireshark 后把其安装目录加入 PATH。
+   - 在 CMD / PowerShell 执行：where tcpdump
+     确认能找到可执行文件。
+
+4) PowerShell 禁止运行 Activate.ps1（执行策略）
+   - 方案一（推荐先试）：以当前用户放宽策略（若公司组策略锁定则可能失败）
+       Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+   - 不受策略影响：在项目根目录双击或 CMD 执行
+       activate_venv_pcap.bat
+     或在 CMD 中：
+       call .venv-pcap\Scripts\activate.bat
+   - 单次绕过（PowerShell）：
+       powershell -NoProfile -ExecutionPolicy Bypass -File .\.venv-pcap\Scripts\Activate.ps1
+
+================================================================================
+pip 可安装的依赖（已在 requirements-pcap.txt 中固定版本）
+================================================================================
+   cicflowmeter==0.5.0, pandas==2.2.3, numpy/scipy/scapy/requests（见文件）
+
+5) cicflowmeter 0.5.0 在 Windows 上建议打补丁（工具脚本一键完成）：
+   - main() 参数顺序错误（fields 收到 bool）
+   - 离线读 pcap 时若带 BPF 过滤，Scapy 会调 windump/tcpdump；无 WinDump 时报 tcpdump is not available
+     补丁将离线模式改为 filter=None（FlowSession 仍会丢弃非 TCP/UDP 包）
+   安装依赖后在项目根目录执行一次：
+       .venv-pcap\Scripts\python.exe tools\patch_cicflowmeter_sniffer.py
+   重新创建 venv 后务必再运行该脚本。

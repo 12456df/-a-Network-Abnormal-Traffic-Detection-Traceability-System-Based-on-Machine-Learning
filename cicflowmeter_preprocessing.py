@@ -1,37 +1,27 @@
 """
 cicflowmeter_preprocessing.py
 =============================
-
-使用 CICFlowMeter（Python 版）将 PCAP 文件转换为与 CIC-IDS2017 同结构的 flow 特征 CSV。
-
-依赖（你已安装）：
-    pip install cicflowmeter
-
-本脚本通过调用 cicflowmeter 命令行完成转换，支持：
-- 单个 pcap 文件 -> 单个 CSV
-- 指定目录下所有 pcap -> 每个 pcap 一个 CSV，或合并为一个 CSV
-
-生成后的 CSV 含 80+ 维 flow 特征，可与 MachineLearningCVE 下的数据一起用于训练或对比。
+使用 CICFlowMeter 将 PCAP 转为 flow 特征 CSV（snake_case 列名）。
+环境与依赖：Python 3.12+、requirements-pcap.txt；见 PCAP_MANUAL_SETUP_zh.txt。
+支持单文件/目录、合并、--max-packets（editcap）；对比 TrafficLabelling：tools/compare_flow_csv_to_trafficlabelling.py。
 """
-
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def _get_subprocess_env() -> dict[str, str]:
-    """
-    构造子进程的环境变量，确保 PATH 中包含 tcpdump 所在目录。
-    Cursor 等 IDE 的终端可能未继承用户后加的 PATH，导致 cicflowmeter 内 scapy 找不到 tcpdump。
-    """
     env = dict(os.environ)
     path_sep = os.pathsep
     tcpdump_path = shutil.which("tcpdump")
@@ -39,7 +29,6 @@ def _get_subprocess_env() -> dict[str, str]:
         tcpdump_dir = os.path.dirname(tcpdump_path)
         env["PATH"] = tcpdump_dir + path_sep + env.get("PATH", "")
     else:
-        # 若当前进程找不到 tcpdump，尝试常见路径，便于在 Cursor 终端中也能让子进程找到
         extra_dirs = [r"C:\Tools", r"C:\Tools\WinDump"]
         existing = env.get("PATH", "")
         for d in extra_dirs:
@@ -50,11 +39,6 @@ def _get_subprocess_env() -> dict[str, str]:
 
 
 def _get_cicflowmeter_cmd() -> list[str]:
-    """
-    获取用于调用 CICFlowMeter 的命令列表。
-    优先使用当前 Python 环境下的 cicflowmeter 可执行文件（Scripts/cicflowmeter），
-    避免 python -m cicflowmeter 在部分环境下报「包不能直接执行」。
-    """
     exe_dir = Path(sys.executable).resolve().parent
     if sys.platform == "win32":
         script = exe_dir / "Scripts" / "cicflowmeter.exe"
@@ -62,85 +46,283 @@ def _get_cicflowmeter_cmd() -> list[str]:
         script = exe_dir / "Scripts" / "cicflowmeter"
     if script.exists():
         return [str(script)]
-    # 若 Scripts 下没有，尝试 PATH 中的 cicflowmeter
     which = shutil.which("cicflowmeter")
     if which:
         return [which]
-    # 最后退回 -m，若仍失败请在本环境执行: py -m pip install cicflowmeter
     return [sys.executable, "-m", "cicflowmeter"]
 
 
 @dataclass
 class CICFlowMeterConfig:
-    """
-    CICFlowMeter 调用相关配置。
-    """
-
-    # 输入：单个 pcap 文件（单文件模式时使用）
     pcap_file: Path = PROJECT_ROOT / "rowdata" / "PCAPs" / "Friday-WorkingHours.pcap"
-
-    # 输入：pcap 目录（目录模式时使用，与 pcap_file 二选一）
     pcap_dir: Path | None = None
-
-    # 输出：单文件模式时为 CSV 文件路径；目录模式时为输出目录
     output_path: Path = PROJECT_ROOT / "processed" / "cicflowmeter_friday.csv"
-
-    # 目录模式下是否将所有 pcap 的结果合并为一个 CSV
     merge: bool = False
+    progress_poll_sec: float = 2.0
+    progress_quiet_sec: float = 30.0
+    max_packets: int | None = None
+    slice_keep_path: Path | None = None
 
 
 def _ensure_parent(path: Path) -> None:
-    """确保输出路径的父目录存在。"""
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def run_cicflowmeter_single(pcap_path: Path, csv_path: Path) -> None:
+def _human_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024**2:
+        return f"{n / 1024:.1f} KiB"
+    if n < 1024**3:
+        return f"{n / 1024**2:.1f} MiB"
+    return f"{n / 1024**3:.2f} GiB"
+
+
+def _find_editcap() -> str | None:
+    for name in ("editcap", "editcap.exe"):
+        w = shutil.which(name)
+        if w:
+            return w
+    if sys.platform == "win32":
+        for base in (
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        ):
+            cand = Path(base) / "Wireshark" / "editcap.exe"
+            if cand.is_file():
+                return str(cand)
+    return None
+
+
+def slice_pcap_max_packets(
+    pcap_path: Path,
+    max_packets: int,
+    *,
+    keep_path: Path | None = None,
+) -> tuple[Path, bool]:
     """
-    对单个 pcap 文件运行 CICFlowMeter，输出一个 CSV。
+    用 editcap 保留前 max_packets 个包（Wireshark 包号为 1 起）。
+    注意：不能用 ``-c N``，那是「按 N 个包拆成多个输出文件」，主 outfile 常为 0 字节。
+    正确写法：``editcap -r in out 1-N`` 表示只写入第 1～N 号包。
     """
+    if max_packets < 1:
+        raise ValueError("max_packets 须 >= 1")
+    exe = _find_editcap()
+    if not exe:
+        raise FileNotFoundError(
+            "未找到 editcap（通常随 Wireshark 安装）。请安装 Wireshark 或将 editcap 加入 PATH。"
+        )
+    if keep_path is not None:
+        keep_path = keep_path.resolve()
+        keep_path.parent.mkdir(parents=True, exist_ok=True)
+        out = keep_path
+        is_temp = False
+    else:
+        fd, tmp = tempfile.mkstemp(suffix=".pcap", prefix="cicflow_slice_")
+        os.close(fd)
+        out = Path(tmp)
+        is_temp = True
+    # -r：保留所选包；默认可删除所选包。范围 1-N 为 editcap 的 1-based 包序号。
+    cmd = [exe, "-r", str(pcap_path.resolve()), str(out), f"1-{max_packets}"]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        if is_temp:
+            out.unlink(missing_ok=True)
+        msg = (r.stderr or r.stdout or "").strip() or f"exit {r.returncode}"
+        raise RuntimeError(f"editcap 失败: {msg}")
+    try:
+        sz = out.stat().st_size
+    except OSError:
+        sz = 0
+    if sz == 0:
+        if is_temp:
+            out.unlink(missing_ok=True)
+        raise RuntimeError(
+            "editcap 输出的 PCAP 为 0 字节。若你曾用错 -c 会得到此现象；"
+            "当前已改为 -r 1-N。请确认输入文件非空且 max_packets 合理。"
+        )
+    print(
+        f"[cicflowmeter_preprocessing] 已截取前 {max_packets} 个包 -> {out} ({_human_size(sz)}) "
+        f"({'临时' if is_temp else '保留'})",
+        flush=True,
+    )
+    return out, is_temp
+
+
+def _run_subprocess_monitoring_csv(
+    cmd: list[str],
+    env: dict[str, str],
+    csv_path: Path,
+    pcap_size: int,
+    *,
+    label: str,
+    poll_sec: float = 2.0,
+    quiet_sec: float = 30.0,
+) -> int:
+    proc = subprocess.Popen(cmd, env=env)
+    t0 = time.monotonic()
+    min_print_gap = min(1.0, max(0.2, poll_sec * 0.5))
+
+    def monitor() -> None:
+        last_size = -1
+        last_flows = -1
+        last_print = 0.0
+        last_growth = time.monotonic()
+        byte_pos = 0
+        newlines = 0
+        read_ok = True
+        while proc.poll() is None:
+            time.sleep(poll_sec)
+            now = time.monotonic()
+            elapsed = now - t0
+            if not csv_path.exists():
+                if now - last_print >= quiet_sec:
+                    print(
+                        f"[cicflowmeter_preprocessing] 进度: {label} | "
+                        f"尚无输出 CSV（首个 flow 写完前可能较久），已运行 {elapsed:.0f}s",
+                        flush=True,
+                    )
+                    last_print = now
+                continue
+            try:
+                sz = csv_path.stat().st_size
+            except OSError:
+                continue
+            if read_ok and sz > byte_pos:
+                try:
+                    with open(csv_path, "rb") as f:
+                        f.seek(byte_pos)
+                        chunk = f.read()
+                    newlines += chunk.count(b"\n")
+                    byte_pos += len(chunk)
+                except OSError:
+                    read_ok = False
+            flows = max(0, newlines - 1) if newlines else 0
+            changed = sz != last_size or flows != last_flows
+            if changed:
+                last_growth = now
+            if changed and (last_print == 0.0 or now - last_print >= min_print_gap):
+                parts = [f"CSV {_human_size(sz)}"]
+                if read_ok and newlines >= 2:
+                    parts.append(f"约 {flows:,} 条 flow")
+                elif read_ok and newlines == 1:
+                    parts.append("已写表头，尚无数值行")
+                elif not read_ok:
+                    parts.append("行数暂不可读（输出文件被占用时 Windows 可能无法并行读取）")
+                parts.append(f"输入 pcap {_human_size(pcap_size)}")
+                print(
+                    f"[cicflowmeter_preprocessing] 进度: {label} | "
+                    f"{' | '.join(parts)} | 已运行 {elapsed:.0f}s",
+                    flush=True,
+                )
+                last_print = now
+                last_size = sz
+                last_flows = flows
+            elif (
+                not changed
+                and sz > 0
+                and (now - last_growth) >= quiet_sec
+                and (now - last_print) >= quiet_sec
+            ):
+                print(
+                    f"[cicflowmeter_preprocessing] 进度: {label} | "
+                    f"CSV 已 {_human_size(sz)}，一段时间内未继续增长（可能接近结束或仍在计算），"
+                    f"已运行 {elapsed:.0f}s",
+                    flush=True,
+                )
+                last_print = now
+
+    th = threading.Thread(target=monitor, name="cicflowmeter_csv_monitor", daemon=True)
+    th.start()
+    try:
+        return proc.wait()
+    except BaseException:
+        proc.kill()
+        raise
+    finally:
+        th.join(timeout=poll_sec * 3)
+
+
+def run_cicflowmeter_single(
+    pcap_path: Path,
+    csv_path: Path,
+    *,
+    file_index: int | None = None,
+    file_total: int | None = None,
+    progress_poll_sec: float = 2.0,
+    progress_quiet_sec: float = 30.0,
+) -> None:
     if not pcap_path.exists():
         raise FileNotFoundError(f"PCAP 文件不存在: {pcap_path}")
-
     _ensure_parent(csv_path)
-    cmd = _get_cicflowmeter_cmd() + [
-        "-f",
-        str(pcap_path),
-        "-c",
-        str(csv_path),
-    ]
-    print(f"[cicflowmeter_preprocessing] 执行: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=False, env=_get_subprocess_env())
-    if result.returncode != 0:
-        raise RuntimeError(f"CICFlowMeter 退出码非 0: {result.returncode}")
-    print(f"[cicflowmeter_preprocessing] 已生成: {csv_path}")
+    sz = pcap_path.stat().st_size
+    idx_str = ""
+    if file_index is not None and file_total is not None:
+        idx_str = f"[{file_index}/{file_total}] "
+    print(
+        f"[cicflowmeter_preprocessing] 开始 {idx_str}{pcap_path.name} "
+        f"({_human_size(sz)}) -> {csv_path.name}",
+        flush=True,
+    )
+    print(
+        "[cicflowmeter_preprocessing] 提示: 大 pcap 可能需数十分钟；"
+        f"将每约 {progress_poll_sec:.0f}s 根据输出 CSV 体积/flow 数刷新进度。",
+        flush=True,
+    )
+    cmd = _get_cicflowmeter_cmd() + ["-f", str(pcap_path), "-c", str(csv_path)]
+    print(f"[cicflowmeter_preprocessing] 命令: {' '.join(cmd)}", flush=True)
+    label = f"{pcap_path.name}"
+    if idx_str:
+        label = f"{idx_str.strip()} {label}"
+    t0 = time.monotonic()
+    code = _run_subprocess_monitoring_csv(
+        cmd,
+        _get_subprocess_env(),
+        csv_path,
+        sz,
+        label=label,
+        poll_sec=progress_poll_sec,
+        quiet_sec=progress_quiet_sec,
+    )
+    if code != 0:
+        raise RuntimeError(f"CICFlowMeter 退出码非 0: {code}")
+    dt = time.monotonic() - t0
+    print(
+        f"[cicflowmeter_preprocessing] 本文件结束，用时 {dt:.0f}s ({dt/60:.1f} min): {csv_path}",
+        flush=True,
+    )
 
 
 def run_cicflowmeter_dir(
     pcap_dir: Path,
     output_dir: Path,
     merge: bool = False,
+    progress_poll_sec: float = 2.0,
+    progress_quiet_sec: float = 30.0,
 ) -> None:
-    """
-    对指定目录下所有 .pcap 文件逐个运行 CICFlowMeter（当前安装版仅支持 -f 单文件，不支持 -d 目录）。
-    - 每个 pcap 生成一个 CSV 到 output_dir，文件名为 <pcap 原名>.csv。
-    - merge=True 时，先逐个生成后再合并为一个 CSV（见下方实现）。
-    """
     if not pcap_dir.is_dir():
         raise FileNotFoundError(f"目录不存在: {pcap_dir}")
-
     output_dir.mkdir(parents=True, exist_ok=True)
     pcap_files = sorted(pcap_dir.glob("*.pcap"))
     if not pcap_files:
         print(f"[cicflowmeter_preprocessing] 目录下未找到 .pcap 文件: {pcap_dir}")
         return
-
-    for pcap_path in pcap_files:
+    total = len(pcap_files)
+    print(
+        f"[cicflowmeter_preprocessing] 目录模式: 共 {total} 个 pcap，输出目录: {output_dir}",
+        flush=True,
+    )
+    for i, pcap_path in enumerate(pcap_files, start=1):
         csv_path = output_dir / f"{pcap_path.stem}.csv"
-        print(f"[cicflowmeter_preprocessing] 处理: {pcap_path.name} -> {csv_path.name}")
-        run_cicflowmeter_single(pcap_path, csv_path)
-
+        run_cicflowmeter_single(
+            pcap_path,
+            csv_path,
+            file_index=i,
+            file_total=total,
+            progress_poll_sec=progress_poll_sec,
+            progress_quiet_sec=progress_quiet_sec,
+        )
     if merge and len(pcap_files) > 1:
-        # 简单合并：将已生成的 CSV 按顺序拼成一个（需 pandas）
         try:
             import pandas as pd
             dfs = []
@@ -158,38 +340,96 @@ def run_cicflowmeter_dir(
 
 
 def run_cicflowmeter_preprocessing(config: CICFlowMeterConfig | None = None) -> None:
-    """
-    根据配置执行 CICFlowMeter 转换。
-    - 若 config.pcap_dir 不为 None，则按目录模式运行；
-    - 否则按单文件模式，使用 config.pcap_file 与 config.output_path。
-    """
     if config is None:
         config = CICFlowMeterConfig()
-
     if config.pcap_dir is not None:
         run_cicflowmeter_dir(
             config.pcap_dir,
             config.output_path,
             merge=config.merge,
+            progress_poll_sec=config.progress_poll_sec,
+            progress_quiet_sec=config.progress_quiet_sec,
         )
     else:
-        run_cicflowmeter_single(config.pcap_file, config.output_path)
+        pcap_in = config.pcap_file
+        temp_slice: Path | None = None
+        try:
+            if config.max_packets is not None:
+                pcap_in, is_tmp = slice_pcap_max_packets(
+                    config.pcap_file,
+                    config.max_packets,
+                    keep_path=config.slice_keep_path,
+                )
+                if is_tmp:
+                    temp_slice = pcap_in
+            run_cicflowmeter_single(
+                pcap_in,
+                config.output_path,
+                progress_poll_sec=config.progress_poll_sec,
+                progress_quiet_sec=config.progress_quiet_sec,
+            )
+        finally:
+            if temp_slice is not None:
+                temp_slice.unlink(missing_ok=True)
+
+
+def _parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="CICFlowMeter PCAP -> flow CSV")
+    ap.add_argument("--pcap", type=Path, default=None)
+    ap.add_argument("--out-csv", type=Path, default=None)
+    ap.add_argument("--pcap-dir", type=Path, default=None)
+    ap.add_argument("--out-dir", type=Path, default=None)
+    ap.add_argument("--merge", action="store_true")
+    ap.add_argument("--max-packets", type=int, default=None)
+    ap.add_argument("--keep-slice", type=Path, default=None)
+    ap.add_argument("--progress-poll", type=float, default=2.0)
+    ap.add_argument("--progress-quiet", type=float, default=30.0)
+    return ap.parse_args()
 
 
 def main() -> None:
-    """
-    处理 rowdata/PCAPs/ 下所有 .pcap 文件，每个 pcap 分别生成一个 CSV，保存到 pcap_processed/ 下（不合并）。
-    """
-    config = CICFlowMeterConfig(
-        pcap_dir=PROJECT_ROOT / "rowdata" / "PCAPs",
-        output_path=PROJECT_ROOT / "pcap_processed",
-        merge=False,
-    )
-    run_cicflowmeter_preprocessing(config)
+    args = _parse_args()
+    print("[cicflowmeter_preprocessing] 开始使用 CICFlowMeter 处理 PCAP...", flush=True)
+    if args.pcap is not None and args.pcap_dir is not None:
+        raise SystemExit("不能同时指定 --pcap 与 --pcap-dir")
+    if args.max_packets is not None and args.pcap is None:
+        raise SystemExit("--max-packets 仅可与 --pcap 同用")
+    if args.keep_slice is not None and args.max_packets is None:
+        raise SystemExit("--keep-slice 需配合 --max-packets")
+    if args.pcap is not None:
+        out = args.out_csv or (PROJECT_ROOT / "pcap_processed" / f"{args.pcap.stem}.csv")
+        cfg = CICFlowMeterConfig(
+            pcap_file=args.pcap.resolve(),
+            pcap_dir=None,
+            output_path=out.resolve(),
+            merge=False,
+            progress_poll_sec=args.progress_poll,
+            progress_quiet_sec=args.progress_quiet,
+            max_packets=args.max_packets,
+            slice_keep_path=args.keep_slice.resolve() if args.keep_slice else None,
+        )
+    elif args.pcap_dir is not None:
+        out_dir = args.out_dir or (PROJECT_ROOT / "pcap_processed")
+        cfg = CICFlowMeterConfig(
+            pcap_file=PROJECT_ROOT / "rowdata" / "PCAPs" / "Friday-WorkingHours.pcap",
+            pcap_dir=args.pcap_dir.resolve(),
+            output_path=out_dir.resolve(),
+            merge=args.merge,
+            progress_poll_sec=args.progress_poll,
+            progress_quiet_sec=args.progress_quiet,
+        )
+    else:
+        cfg = CICFlowMeterConfig(
+            pcap_dir=PROJECT_ROOT / "rowdata" / "PCAPs",
+            output_path=PROJECT_ROOT / "pcap_processed",
+            merge=args.merge,
+            progress_poll_sec=args.progress_poll,
+            progress_quiet_sec=args.progress_quiet,
+        )
+    run_cicflowmeter_preprocessing(cfg)
 
 
 if __name__ == "__main__":
-    print("[cicflowmeter_preprocessing] 开始使用 CICFlowMeter 处理 PCAP...")
     try:
         main()
     except Exception as exc:
