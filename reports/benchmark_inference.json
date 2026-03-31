@@ -1,0 +1,9 @@
+{
+  "created_at": "2026-03-29T13:40:42.535808+00:00",
+  "n_rows_per_batch": 200,
+  "repeat": 2,
+  "warmup": 2,
+  "rf_seconds_total": 0.146044,
+  "rf_flows_per_second": 2738.91,
+  "note": "单进程、批量 predict_proba；非真实在线链路延迟。"
+}

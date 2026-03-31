@@ -2,7 +2,7 @@
 cicflowmeter_preprocessing.py
 =============================
 使用 CICFlowMeter 将 PCAP 转为 flow 特征 CSV（snake_case 列名）。
-环境与依赖：Python 3.12+、requirements-pcap.txt；见 PCAP_MANUAL_SETUP_zh.txt。
+环境与依赖：Python 3.12+、项目根目录 requirements-pcap.txt；见 docs/PCAP_MANUAL_SETUP_zh.txt。
 支持单文件/目录、合并、--max-packets（editcap）；对比 TrafficLabelling：tools/compare_flow_csv_to_trafficlabelling.py。
 """
 from __future__ import annotations

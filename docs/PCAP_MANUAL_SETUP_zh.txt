@@ -1,5 +1,6 @@
 ================================================================================
 PCAP / CICFlowMeter 方案 A — 需你本机自行配置（无法用 pip 安装）
+文档位置：docs/PCAP_MANUAL_SETUP_zh.txt（依赖清单在项目根目录 requirements-pcap.txt）
 ================================================================================
 
 1) Python 3.12.x
@@ -7,7 +8,7 @@ PCAP / CICFlowMeter 方案 A — 需你本机自行配置（无法用 pip 安装
    - cicflowmeter 0.5.0 要求 Python >= 3.12；若主项目仍用 3.10，请为 PCAP 单独建虚拟环境：
        py -3.12 -m venv .venv-pcap
        .venv-pcap\Scripts\activate
-       pip install -r requirements-pcap.txt
+       （在项目根目录执行）pip install -r requirements-pcap.txt
 
 2) Npcap（Windows 抓包驱动）
    - 从 https://npcap.com/ 下载并安装（例如 1.87 或官网当前稳定版）。
@@ -29,7 +30,7 @@ PCAP / CICFlowMeter 方案 A — 需你本机自行配置（无法用 pip 安装
        powershell -NoProfile -ExecutionPolicy Bypass -File .\.venv-pcap\Scripts\Activate.ps1
 
 ================================================================================
-pip 可安装的依赖（已在 requirements-pcap.txt 中固定版本）
+pip 可安装的依赖（已在项目根目录 requirements-pcap.txt 中固定版本）
 ================================================================================
    cicflowmeter==0.5.0, pandas==2.2.3, numpy/scipy/scapy/requests（见文件）
 

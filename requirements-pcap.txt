@@ -1,5 +1,5 @@
 # PCAP / CICFlowMeter (Scheme A). Python 3.12+ required for cicflowmeter==0.5.0.
-# Manual steps (Npcap, tcpdump, Python install): see PCAP_MANUAL_SETUP_zh.txt
+# Manual steps (Npcap, tcpdump, Python install): see docs/PCAP_MANUAL_SETUP_zh.txt
 # After pip install: run tools/patch_cicflowmeter_sniffer.py once (fixes cicflowmeter 0.5.0 CLI bug).
 
 cicflowmeter==0.5.0

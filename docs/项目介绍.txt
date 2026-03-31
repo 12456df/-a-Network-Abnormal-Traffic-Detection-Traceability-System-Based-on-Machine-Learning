@@ -1,0 +1,137 @@
+================================================================================
+  项目介绍 — 基于机器学习的网络异常流量检测与溯源（本仓库）
+================================================================================
+
+一、项目概述
+------------
+本仓库实现一条以 CIC-IDS2017 风格「流表」特征 CSV 为主数据的实验流水线：先对公开
+数据集做清洗与二分类标注，再用有监督 RandomForest 与无监督 Isolation Forest /
+自编码器（AE）/ 变分自编码器（VAE）等模型建模，经四级告警集成融合后输出可下游使用
+的预测与摘要，并可借助 NetworkX、Matplotlib/Seaborn、pyvis（若已安装）等做攻击
+溯源图与时间线等可视化。详细需求与路线见 docs/实际采用的研究方案-需求分析与技术路线.txt；
+本文侧重目录、脚本职责与读写的路径约定，避免重复长段论述。
+
+
+二、推荐阅读顺序与主流程
+------------------------
+建议按数据与依赖关系顺序执行（均为项目根目录下的 Python 脚本）：
+
+  1. csv_preprocessing.py     — 原始 CSV → processed/（特征列、train/val/test 划分等）
+  2. supervised_model.py       — 训练 RF、阈值与测试集流级/可选 IP 级输出 → models/、processed/
+  3. unsupervised_model.py    — IF/AE/VAE、阈值与预测 → models/、processed/
+  4. ensemble_detector.py      — 有监督 + 无监督级联与四级告警 → processed/
+  5. attack_traceback.py       — 基于集成结果的溯源与图/报告 → traceback/
+  6. visualization.py         — 检测侧统计图（依赖集成与预处理产物）
+
+从 PCAP 自建流表为可选支路（与主流程数据格式对齐后仍需走完预处理之后的步骤）：
+
+  · cicflowmeter_preprocessing.py  — CICFlowMeter 将 PCAP 转为 flow CSV（见 docs/PCAP_MANUAL_SETUP_zh.txt）
+
+主数据走向（文字示意）：
+
+  rowdata/  ──►  processed/  ──►  models/  ──►  traceback/ 、 reports/（可选）
+
+
+三、仓库目录结构（文字树）
+--------------------------
+项目根目录
+  ├── 核心脚本：*.py（见下节「根目录模块」）
+  ├── requirements.txt              主流程 Python 依赖
+  ├── requirements-pcap.txt         PCAP / CICFlowMeter 虚拟环境依赖
+  ├── activate_venv_pcap.bat       Windows 下激活 PCAP 专用虚拟环境（若使用方案 A）
+  ├── docs/                         说明文档（本目录）
+  ├── tools/                        辅助与对照实验脚本
+  └── reports/                      可选：SHAP、推理测时等输出（按需生成）
+
+数据与模型等大目录通常不入库（见根目录 .gitignore，克隆后需自备数据或本地生成）：
+
+  rowdata/          原始 CSV、PCAP 等
+  processed/        预处理后的划分 CSV、特征名、集成预测与指标等
+  pcap_processed/  （若脚本使用）PCAP 相关中间产物
+  models/           训练得到的模型与清单、阈值等
+  traceback/        溯源排名、JSON/HTML/PNG 等
+
+
+四、根目录各模块功能（摘要）
+----------------------------
+csv_preprocessing.py
+    扫描并合并原始流表 CSV，清洗后将 Label 转为二分类（BENIGN=0，非 BENIGN=1），
+    划分 train/val/test，写入 processed/（含 feature_names.txt、各类 split CSV、
+    无监督用良性子集等）；不负责训练模型。
+
+supervised_model.py
+    仅使用 RandomForest 做二分类；在验证集上选取高精确率/高召回两套阈值；
+    输出测试集流级异常标记及可选 IP 侧汇总，模型与 manifest 写入 models/。
+
+unsupervised_model.py
+    无监督：Isolation Forest、较宽的 Autoencoder、VAE；含 MI 特征选择与 PCA 等；
+    从 processed/ 读取划分与特征名，将模型、阈值、预测与各类指标写入 models/ 与
+    processed/。
+
+ensemble_detector.py
+    将有监督 RF 与无监督（IF/AE/VAE）分数级联，定义 LOW/MEDIUM/HIGH/CRITICAL
+    四级告警并映射回二分类；可疑流可单独导出供溯源或人工复核。
+
+attack_traceback.py
+    在集成检测结果之上做 IP 威胁评分、攻击子图/路径、证据链汇总；输出 traceback/
+    下 CSV、JSON、HTML（pyvis）、PNG 等。
+
+visualization.py
+    读取集成与预处理产物，生成 ROC/PR、校准、告警分布、特征重要性等检测侧插图；
+    不重复绘制 attack_traceback 已生成的交互路径图。
+
+cicflowmeter_preprocessing.py
+    调用 CICFlowMeter 将 PCAP 转为 snake_case 列名的 flow CSV；支持单文件或目录、
+    合并与包数截断等；环境要求见 docs/PCAP_MANUAL_SETUP_zh.txt。
+
+
+五、tools/ 子模块
+-----------------
+train_supervised_xgboost.py     【主流程可选 / 对照】与 RF 相同数据与阈值策略训练
+                                XGBoost；默认不改变 ensemble 仍使用 RF。
+
+explain_rf_shap.py              【主流程可选】对已训练 RF 做 SHAP TreeExplainer，
+                                默认输出到 reports/shap/。
+
+benchmark_inference.py          【主流程可选】离线测 RF 或（加 --ensemble）集成前向
+                                耗时，结果写出 reports/benchmark_inference.json。
+
+compare_flow_csv_to_trafficlabelling.py  【对照实验】对比 CICFlowMeter 生成 CSV 与
+                                          TrafficLabelling 官方 CSV（列与 Flow ID）。
+
+patch_cicflowmeter_sniffer.py   【环境修补】在 .venv-pcap 中修正 cicflowmeter 0.5.0
+                                sniffer 已知问题，详见脚本内说明。
+
+
+六、主要输入输出约定
+--------------------
+processed/
+  · feature_names.txt              特征列名（一行一列，与模型输入一致）
+  · train_binary.csv / val_binary.csv / test_binary.csv
+  · 无监督训练还可能使用 unsupervised_benign_train.csv 等（由 csv_preprocessing 生成）
+  · 各阶段预测、metrics JSON、IP 汇总、集成输出 test_predictions_ensemble.csv /
+    metrics_ensemble.json 等（随脚本运行逐步产生）
+
+models/
+  · 有监督：如 supervised_rf_binary.joblib 及对应 manifest
+  · 无监督：IF/AE/VAE、scaler、阈值与 manifest 等
+
+traceback/
+  · attack_ip_ranking.csv、attack_paths.json、attack_graph.html、
+    attack_timeline.png、attack_summary_report.json 等（以 attack_traceback 为准）
+
+reports/（可选，运行 tools 或自行放置）
+  · shap/、benchmark_inference.json；visualization 可选读取 trace_eval.json、latency.csv
+
+
+七、环境与扩展阅读
+------------------
+  · 主依赖：根目录 requirements.txt
+  · PCAP 专用虚拟环境：requirements-pcap.txt，配合 docs/PCAP_MANUAL_SETUP_zh.txt
+  · 硬件与软件栈建议：docs/毕业设计软硬件配置.txt
+  · 毕业论文撰写顺序与章节要点：docs/毕业论文编写建议.txt
+  · 文档索引：docs/README.txt
+
+================================================================================
+  本文档路径：docs/项目介绍.txt
+================================================================================
